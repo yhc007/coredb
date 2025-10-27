@@ -1,6 +1,5 @@
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, BTreeMap, BTreeSet};
-use bytes::Bytes;
+use std::collections::HashMap;
 use uuid::Uuid;
 use crate::error::*;
 
@@ -58,7 +57,7 @@ pub struct TableSchema {
 }
 
 /// Cassandra 값 타입
-#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CassandraValue {
     Text(String),
     Int(i32),
@@ -67,11 +66,45 @@ pub enum CassandraValue {
     Timestamp(i64), // microseconds since epoch
     Boolean(bool),
     Double(f64),
-    Blob(Bytes),
+    Blob(Vec<u8>),  // Changed from Bytes to Vec<u8> for serde compatibility
     Null,
-    Map(BTreeMap<CassandraValue, CassandraValue>),
+    Map(HashMap<String, CassandraValue>),  // HashMap doesn't implement Ord
     List(Vec<CassandraValue>),
-    Set(BTreeSet<CassandraValue>),
+    Set(Vec<CassandraValue>),
+}
+
+// Custom Eq implementation for CassandraValue
+impl Eq for CassandraValue {}
+
+// Custom PartialOrd implementation
+impl PartialOrd for CassandraValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        use CassandraValue::*;
+        
+        match (self, other) {
+            (Text(a), Text(b)) => a.partial_cmp(b),
+            (Int(a), Int(b)) => a.partial_cmp(b),
+            (BigInt(a), BigInt(b)) => a.partial_cmp(b),
+            (UUID(a), UUID(b)) => a.partial_cmp(b),
+            (Timestamp(a), Timestamp(b)) => a.partial_cmp(b),
+            (Boolean(a), Boolean(b)) => a.partial_cmp(b),
+            (Double(a), Double(b)) => a.partial_cmp(b),
+            (Blob(a), Blob(b)) => a.partial_cmp(b),
+            (List(a), List(b)) => a.partial_cmp(b),
+            (Set(a), Set(b)) => a.partial_cmp(b),
+            (Null, Null) => Some(Ordering::Equal),
+            (Map(_), Map(_)) => Some(Ordering::Equal), // Maps cannot be ordered
+            _ => None,
+        }
+    }
+}
+
+// Custom Ord implementation
+impl Ord for CassandraValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+    }
 }
 
 impl CassandraValue {
@@ -89,7 +122,7 @@ impl CassandraValue {
             CassandraValue::Map(m) => {
                 let mut size = 8; // length prefix
                 for (k, v) in m {
-                    size += k.serialized_size() + v.serialized_size();
+                    size += 8 + k.len() as u64 + v.serialized_size(); // String key + value
                 }
                 size
             },
@@ -112,7 +145,7 @@ impl CassandraValue {
 }
 
 /// 파티션 키
-#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PartitionKey {
     pub components: Vec<CassandraValue>,
 }
@@ -128,7 +161,7 @@ impl PartitionKey {
 }
 
 /// 클러스터링 키
-#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ClusteringKey {
     pub components: Vec<CassandraValue>,
 }

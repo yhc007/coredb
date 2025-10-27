@@ -95,7 +95,7 @@ impl CompactionManager {
     }
     
     /// 컴팩션 실행
-    async fn execute_compaction(&self, task: CompactionTask) -> Result<(), Error> {
+    async fn execute_compaction(&self, task: CompactionTask) -> Result<()> {
         match task.strategy {
             CompactionStrategy::SizeTiered { .. } => {
                 self.execute_size_tiered_compaction(task).await
@@ -107,7 +107,7 @@ impl CompactionManager {
     }
     
     /// Size-Tiered 컴팩션 실행
-    async fn execute_size_tiered_compaction(&self, task: CompactionTask) -> Result<(), Error> {
+    async fn execute_size_tiered_compaction(&self, task: CompactionTask) -> Result<()> {
         if task.input_sstables.is_empty() {
             return Ok(());
         }
@@ -139,7 +139,7 @@ impl CompactionManager {
     }
     
     /// Leveled 컴팩션 실행
-    async fn execute_leveled_compaction(&self, task: CompactionTask) -> Result<(), Error> {
+    async fn execute_leveled_compaction(&self, task: CompactionTask) -> Result<()> {
         // Leveled 컴팩션은 레벨별로 SSTable을 관리
         // 각 레벨의 SSTable 크기가 일정 비율로 증가
         // L0 -> L1 -> L2 ... 순서로 컴팩션

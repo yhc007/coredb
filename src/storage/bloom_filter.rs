@@ -2,17 +2,31 @@ use bloomfilter::Bloom;
 use crate::schema::{PartitionKey, CassandraValue};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
 
 /// 블룸 필터 래퍼
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
     bloom: Bloom<Vec<u8>>,
+    // 직렬화를 위한 설정 저장
+    expected_items: usize,
+    false_positive_rate: f64,
+}
+
+// PartialEq implementation for SSTable compatibility
+impl PartialEq for BloomFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.expected_items == other.expected_items &&
+        self.false_positive_rate == other.false_positive_rate
+    }
 }
 
 impl BloomFilter {
     pub fn new(expected_items: u64, false_positive_rate: f64) -> Self {
         Self {
             bloom: Bloom::new_for_fp_rate(expected_items as usize, false_positive_rate).expect("Failed to create bloom filter"),
+            expected_items: expected_items as usize,
+            false_positive_rate,
         }
     }
     
@@ -31,6 +45,37 @@ impl BloomFilter {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         hasher.finish().to_le_bytes().to_vec()
+    }
+}
+
+// Custom Serialize implementation
+impl Serialize for BloomFilter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("BloomFilter", 2)?;
+        state.serialize_field("expected_items", &self.expected_items)?;
+        state.serialize_field("false_positive_rate", &self.false_positive_rate)?;
+        state.end()
+    }
+}
+
+// Custom Deserialize implementation
+impl<'de> Deserialize<'de> for BloomFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct BloomFilterData {
+            expected_items: usize,
+            false_positive_rate: f64,
+        }
+        
+        let data = BloomFilterData::deserialize(deserializer)?;
+        Ok(BloomFilter::new(data.expected_items as u64, data.false_positive_rate))
     }
 }
 
@@ -81,9 +126,12 @@ fn hash_cassandra_value<H: Hasher>(value: &CassandraValue, state: &mut H) {
         },
         CassandraValue::Map(m) => {
             state.write_u8(9);
-            for (k, v) in m {
-                hash_cassandra_value(k, state);
-                hash_cassandra_value(v, state);
+            // HashMap을 정렬하여 해시
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            for k in keys {
+                k.hash(state);
+                hash_cassandra_value(m.get(k).unwrap(), state);
             }
         },
         CassandraValue::List(l) => {

@@ -1,0 +1,1 @@
+std::result::Result<std::option::Option<Partition>, error::CoreDBError>

@@ -3,13 +3,14 @@ use std::collections::BTreeMap;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, SeekFrom, AsyncSeekExt};
 use uuid::Uuid;
+use serde::{Serialize, Deserialize};
 use crate::schema::{PartitionKey, Row};
 use crate::storage::{Memtable, BloomFilter};
 use crate::storage::memtable::Partition;
 use crate::error::*;
 
 /// 압축 타입
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionType {
     None,
     LZ4,
@@ -18,7 +19,7 @@ pub enum CompressionType {
 }
 
 /// SSTable 구조
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SSTable {
     pub id: String,
     pub file_path: PathBuf,
@@ -50,7 +51,7 @@ impl SSTable {
         memtable: &Memtable,
         base_dir: &PathBuf,
         compression: CompressionType
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         let sstable_id = Uuid::new_v4().to_string();
         let data_file_path = base_dir.join(format!("{}-Data.db", sstable_id));
         
@@ -151,13 +152,13 @@ impl SSTable {
             summary_index,
             min_timestamp,
             max_timestamp,
-            compression,
+            compression: compression.clone(),
             size_bytes: total_size,
         })
     }
     
     /// 파티션 읽기
-    pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>, Error> {
+    pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
         // 1. 블룸 필터 체크
         if !self.bloom_filter.might_contain(partition_key) {
             return Ok(None);
@@ -189,7 +190,7 @@ impl SSTable {
     }
     
     /// 파티션 직렬화 및 압축
-    async fn serialize_partition(partition: &Partition, compression: &CompressionType) -> Result<Vec<u8>, Error> {
+    async fn serialize_partition(partition: &Partition, compression: &CompressionType) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         
         // Static 컬럼들 직렬화
@@ -232,7 +233,7 @@ impl SSTable {
     }
     
     /// 파티션 역직렬화 및 압축 해제
-    async fn deserialize_partition(data: &[u8], compression: &CompressionType) -> Result<Partition, Error> {
+    async fn deserialize_partition(data: &[u8], compression: &CompressionType) -> Result<Partition> {
         // 압축 해제
         let decompressed_data = match compression {
             CompressionType::None => data.to_vec(),
@@ -295,24 +296,22 @@ impl SSTable {
     }
     
     /// SSTable 삭제
-    pub async fn delete(&self) -> Result<(), Error> {
+    pub async fn delete(&self) -> Result<()> {
         tokio::fs::remove_file(&self.file_path).await?;
         Ok(())
     }
     
     /// 파일 크기 가져오기
-    pub async fn file_size(&self) -> Result<u64, Error> {
+    pub async fn file_size(&self) -> Result<u64> {
         let metadata = tokio::fs::metadata(&self.file_path).await?;
         Ok(metadata.len())
     }
 }
 
-use serde::{Serialize, Deserialize};
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{CassandraValue, ColumnDefinition, CassandraDataType, Cell};
+    use crate::schema::{CassandraValue, ColumnDefinition, CassandraDataType, Cell, ClusteringKey};
     use std::collections::HashMap;
     
     fn create_test_schema() -> std::sync::Arc<crate::schema::TableSchema> {
@@ -370,7 +369,7 @@ mod tests {
         
         // 테스트 데이터 추가
         for i in 1..=5 {
-            let row = create_test_row(i, i * 1000, &format!("value_{}", i));
+            let row = create_test_row(i, (i * 1000) as i64, &format!("value_{}", i));
             memtable.put(row).unwrap();
         }
         

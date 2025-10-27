@@ -1,0 +1,1 @@
+std::result::Result<Vec<CommitLogEntry>, error::CoreDBError>

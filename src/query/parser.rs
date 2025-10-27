@@ -97,7 +97,7 @@ pub enum ComparisonOperator {
 pub struct CqlParser;
 
 impl CqlParser {
-    pub fn parse(query: &str) -> Result<CqlStatement, CoreDBError> {
+    pub fn parse(query: &str) -> Result<CqlStatement> {
         let query = query.trim();
         
         if query.to_uppercase().starts_with("CREATE KEYSPACE") {
@@ -125,7 +125,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_create_keyspace(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_create_keyspace(query: &str) -> Result<CqlStatement> {
         // 간단한 파싱 - 실제로는 더 정교한 파서가 필요
         let re = regex::Regex::new(r"CREATE\s+KEYSPACE\s+(\w+)\s+WITH\s+REPLICATION\s*=\s*\{.*'replication_factor'\s*:\s*(\d+).*\}")?;
         
@@ -147,7 +147,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_create_table(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_create_table(query: &str) -> Result<CqlStatement> {
         // 매우 간단한 파싱 - 실제로는 더 정교한 파서가 필요
         let re = regex::Regex::new(r"CREATE\s+TABLE\s+(\w+)\.(\w+)\s*\((.*)\)")?;
         
@@ -201,7 +201,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_insert(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_insert(query: &str) -> Result<CqlStatement> {
         // 간단한 INSERT 파싱
         let re = regex::Regex::new(r"INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)")?;
         
@@ -238,7 +238,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_select(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_select(query: &str) -> Result<CqlStatement> {
         // 간단한 SELECT 파싱
         let re = regex::Regex::new(r"SELECT\s+(.+?)\s+FROM\s+(\w+)\.(\w+)")?;
         
@@ -281,21 +281,21 @@ impl CqlParser {
         }
     }
     
-    fn parse_update(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_update(query: &str) -> Result<CqlStatement> {
         // 간단한 UPDATE 파싱
         Err(CoreDBError::QueryParsingError {
             message: "UPDATE not implemented yet".to_string(),
         })
     }
     
-    fn parse_delete(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_delete(query: &str) -> Result<CqlStatement> {
         // 간단한 DELETE 파싱
         Err(CoreDBError::QueryParsingError {
             message: "DELETE not implemented yet".to_string(),
         })
     }
     
-    fn parse_drop_table(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_drop_table(query: &str) -> Result<CqlStatement> {
         let re = regex::Regex::new(r"DROP\s+TABLE\s+(\w+)\.(\w+)")?;
         
         if let Some(caps) = re.captures(query) {
@@ -310,7 +310,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_drop_keyspace(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_drop_keyspace(query: &str) -> Result<CqlStatement> {
         let re = regex::Regex::new(r"DROP\s+KEYSPACE\s+(\w+)")?;
         
         if let Some(caps) = re.captures(query) {
@@ -324,7 +324,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_use(query: &str) -> Result<CqlStatement, CoreDBError> {
+    fn parse_use(query: &str) -> Result<CqlStatement> {
         let re = regex::Regex::new(r"USE\s+(\w+)")?;
         
         if let Some(caps) = re.captures(query) {
@@ -338,7 +338,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_where_clause(query: &str) -> Result<WhereClause, CoreDBError> {
+    fn parse_where_clause(query: &str) -> Result<WhereClause> {
         let re = regex::Regex::new(r"WHERE\s+(\w+)\s*=\s*([^\\s]+)")?;
         
         if let Some(caps) = re.captures(query) {
@@ -360,8 +360,8 @@ impl CqlParser {
         }
     }
     
-    fn parse_data_type(type_str: &str) -> Result<CassandraDataType, CoreDBError> {
-        match type_str.to_uppercase() {
+    fn parse_data_type(type_str: &str) -> Result<CassandraDataType> {
+        match type_str.to_uppercase().as_str() {
             "TEXT" | "VARCHAR" => Ok(CassandraDataType::Text),
             "INT" => Ok(CassandraDataType::Int),
             "BIGINT" => Ok(CassandraDataType::BigInt),
@@ -376,7 +376,7 @@ impl CqlParser {
         }
     }
     
-    fn parse_value(value_str: &str) -> Result<CassandraValue, CoreDBError> {
+    fn parse_value(value_str: &str) -> Result<CassandraValue> {
         let value = value_str.trim();
         
         if value == "NULL" {

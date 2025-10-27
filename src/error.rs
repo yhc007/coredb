@@ -30,7 +30,7 @@ pub enum CoreDBError {
     LZ4(#[from] lz4_flex::block::DecompressError),
     
     #[error("ZSTD error: {0}")]
-    ZSTD(#[from] std::io::Error),
+    ZstdError(String),
     
     #[error("Table not found: {table}")]
     TableNotFound { table: String },

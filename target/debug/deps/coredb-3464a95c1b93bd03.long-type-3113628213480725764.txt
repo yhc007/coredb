@@ -1,0 +1,2 @@
+SkipMap<std::option::Option<ClusteringKey>, schema::Row>
+&SkipMap<std::option::Option<ClusteringKey>, schema::Row>

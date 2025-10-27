@@ -20,7 +20,7 @@ impl QueryEngine {
     }
     
     /// CQL 문 실행
-    pub async fn execute(&mut self, statement: CqlStatement) -> Result<QueryResult, CoreDBError> {
+    pub async fn execute(&mut self, statement: CqlStatement) -> Result<QueryResult> {
         match statement {
             CqlStatement::CreateKeyspace { name, options } => {
                 self.create_keyspace(name, options).await
@@ -52,7 +52,7 @@ impl QueryEngine {
         }
     }
     
-    async fn create_keyspace(&mut self, name: String, _options: crate::query::parser::KeyspaceOptions) -> Result<QueryResult, CoreDBError> {
+    async fn create_keyspace(&mut self, name: String, _options: crate::query::parser::KeyspaceOptions) -> Result<QueryResult> {
         // 키스페이스 생성 (단순화된 버전)
         if !self.memtables.contains_key(&name) {
             self.memtables.insert(name.clone(), HashMap::new());
@@ -61,7 +61,7 @@ impl QueryEngine {
         Ok(QueryResult::success())
     }
     
-    async fn create_table(&mut self, keyspace: String, name: String, columns: Vec<crate::schema::ColumnDefinition>, partition_key: Vec<String>, clustering_key: Vec<String>, _options: crate::query::parser::TableOptions) -> Result<QueryResult, CoreDBError> {
+    async fn create_table(&mut self, keyspace: String, name: String, columns: Vec<crate::schema::ColumnDefinition>, partition_key: Vec<String>, clustering_key: Vec<String>, _options: crate::query::parser::TableOptions) -> Result<QueryResult> {
         // 테이블 스키마 생성
         let mut pk_columns = Vec::new();
         let mut ck_columns = Vec::new();
@@ -106,7 +106,7 @@ impl QueryEngine {
         Ok(QueryResult::success())
     }
     
-    async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>) -> Result<QueryResult, CoreDBError> {
+    async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>) -> Result<QueryResult> {
         // 테이블 찾기
         let memtable = self.get_memtable(&keyspace, &table)?;
         let schema = memtable.table_schema();
@@ -139,7 +139,7 @@ impl QueryEngine {
         Ok(QueryResult::success())
     }
     
-    async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>) -> Result<QueryResult, CoreDBError> {
+    async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>) -> Result<QueryResult> {
         // 테이블 찾기
         let memtable = self.get_memtable(&keyspace, &table)?;
         let schema = memtable.table_schema();
@@ -193,21 +193,21 @@ impl QueryEngine {
         Ok(QueryResult::rows(results))
     }
     
-    async fn update_row(&mut self, _keyspace: String, _table: String, _values: Vec<(String, CassandraValue)>, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult, CoreDBError> {
+    async fn update_row(&mut self, _keyspace: String, _table: String, _values: Vec<(String, CassandraValue)>, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
         // UPDATE는 INSERT로 구현 (Cassandra 스타일)
         Err(CoreDBError::QueryParsingError {
             message: "UPDATE not implemented yet".to_string(),
         })
     }
     
-    async fn delete_row(&mut self, _keyspace: String, _table: String, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult, CoreDBError> {
+    async fn delete_row(&mut self, _keyspace: String, _table: String, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
         // DELETE 구현
         Err(CoreDBError::QueryParsingError {
             message: "DELETE not implemented yet".to_string(),
         })
     }
     
-    async fn drop_table(&mut self, keyspace: String, name: String) -> Result<QueryResult, CoreDBError> {
+    async fn drop_table(&mut self, keyspace: String, name: String) -> Result<QueryResult> {
         if let Some(tables) = self.memtables.get_mut(&keyspace) {
             tables.remove(&name);
         }
@@ -219,18 +219,18 @@ impl QueryEngine {
         Ok(QueryResult::success())
     }
     
-    async fn drop_keyspace(&mut self, name: String) -> Result<QueryResult, CoreDBError> {
+    async fn drop_keyspace(&mut self, name: String) -> Result<QueryResult> {
         self.memtables.remove(&name);
         self.sstables.remove(&name);
         Ok(QueryResult::success())
     }
     
-    async fn use_keyspace(&mut self, _keyspace: String) -> Result<QueryResult, CoreDBError> {
+    async fn use_keyspace(&mut self, _keyspace: String) -> Result<QueryResult> {
         // 현재 키스페이스 설정 (단순화된 버전)
         Ok(QueryResult::success())
     }
     
-    fn get_memtable(&self, keyspace: &str, table: &str) -> Result<Arc<Memtable>, CoreDBError> {
+    fn get_memtable(&self, keyspace: &str, table: &str) -> Result<Arc<Memtable>> {
         self.memtables
             .get(keyspace)
             .ok_or_else(|| CoreDBError::KeyspaceNotFound { keyspace: keyspace.to_string() })?
@@ -239,7 +239,7 @@ impl QueryEngine {
             .map(|m| m.clone())
     }
     
-    fn extract_keys_from_values(&self, values: Vec<(String, CassandraValue)>, schema: &TableSchema) -> Result<(PartitionKey, Option<ClusteringKey>), CoreDBError> {
+    fn extract_keys_from_values(&self, values: Vec<(String, CassandraValue)>, schema: &TableSchema) -> Result<(PartitionKey, Option<ClusteringKey>)> {
         let mut partition_components = Vec::new();
         let mut clustering_components = Vec::new();
         

@@ -37,7 +37,7 @@ pub struct CommitLog {
 }
 
 impl CommitLog {
-    pub async fn new(base_dir: PathBuf) -> Result<Self, Error> {
+    pub async fn new(base_dir: PathBuf) -> Result<Self> {
         tokio::fs::create_dir_all(&base_dir).await?;
         
         let segment_path = base_dir.join(format!("commitlog-{}.log", 0));
@@ -56,7 +56,7 @@ impl CommitLog {
         })
     }
     
-    pub async fn append(&mut self, entry: CommitLogEntry) -> Result<(), Error> {
+    pub async fn append(&mut self, entry: CommitLogEntry) -> Result<()> {
         let serialized = bincode::serialize(&entry)?;
         let entry_size = serialized.len() as u64;
         
@@ -75,7 +75,7 @@ impl CommitLog {
         Ok(())
     }
     
-    async fn rotate_segment(&mut self) -> Result<(), Error> {
+    async fn rotate_segment(&mut self) -> Result<()> {
         self.current_segment.flush().await?;
         
         self.segment_id += 1;
@@ -95,7 +95,7 @@ impl CommitLog {
     }
     
     /// 복구를 위한 replay 기능
-    pub async fn replay_from_segment(&self, segment_id: u64) -> Result<Vec<CommitLogEntry>, Error> {
+    pub async fn replay_from_segment(&self, segment_id: u64) -> Result<Vec<CommitLogEntry>> {
         let segment_path = self.base_directory
             .join(format!("commitlog-{}.log", segment_id));
         
@@ -129,7 +129,7 @@ impl CommitLog {
     }
     
     /// 모든 세그먼트에서 replay
-    pub async fn replay_all(&self) -> Result<Vec<CommitLogEntry>, Error> {
+    pub async fn replay_all(&self) -> Result<Vec<CommitLogEntry>> {
         let mut all_entries = Vec::new();
         let mut segment_id = 0;
         
@@ -146,7 +146,7 @@ impl CommitLog {
     }
     
     /// 오래된 세그먼트 정리
-    pub async fn cleanup_old_segments(&self, keep_segments: u64) -> Result<(), Error> {
+    pub async fn cleanup_old_segments(&self, keep_segments: u64) -> Result<()> {
         let mut segment_id = 0;
         
         loop {

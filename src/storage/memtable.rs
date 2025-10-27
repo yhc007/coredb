@@ -96,7 +96,17 @@ impl Memtable {
     
     pub fn get_all_partitions(&self) -> Vec<(PartitionKey, Partition)> {
         self.partitions.iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| {
+                let key = entry.key().clone();
+                let partition = entry.value();
+                // Clone Partition manually since SkipMap doesn't implement Clone
+                let mut new_partition = Partition::new();
+                new_partition.static_columns = partition.static_columns.clone();
+                for row_entry in partition.rows.iter() {
+                    new_partition.rows.insert(row_entry.key().clone(), row_entry.value().clone());
+                }
+                (key, new_partition)
+            })
             .collect()
     }
     

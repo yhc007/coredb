@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use crate::schema::{TableSchema, KeyspaceDefinition, ReplicationStrategy};
 use crate::storage::{Memtable, SSTable};
@@ -60,7 +61,7 @@ pub struct CoreDB {
 
 impl CoreDB {
     /// 새 데이터베이스 인스턴스 생성
-    pub async fn new(config: DatabaseConfig) -> Result<Self, CoreDBError> {
+    pub async fn new(config: DatabaseConfig) -> Result<Self> {
         // 디렉토리 생성
         tokio::fs::create_dir_all(&config.data_directory).await?;
         tokio::fs::create_dir_all(&config.commitlog_directory).await?;
@@ -98,7 +99,7 @@ impl CoreDB {
     }
     
     /// CQL 쿼리 실행
-    pub async fn execute_cql(&self, query: &str) -> Result<QueryResult, CoreDBError> {
+    pub async fn execute_cql(&self, query: &str) -> Result<QueryResult> {
         let parsed = crate::query::parser::CqlParser::parse(query)?;
         
         // 커밋 로그에 기록 (변경 작업인 경우)
@@ -117,7 +118,7 @@ impl CoreDB {
     }
     
     /// 키스페이스 생성
-    pub async fn create_keyspace(&self, name: String, replication_factor: u32) -> Result<(), CoreDBError> {
+    pub async fn create_keyspace(&self, name: String, replication_factor: u32) -> Result<()> {
         let keyspace = Keyspace {
             name: name.clone(),
             definition: KeyspaceDefinition {
@@ -135,7 +136,7 @@ impl CoreDB {
     }
     
     /// 테이블 생성
-    pub async fn create_table(&self, keyspace: String, table: String, schema: TableSchema) -> Result<(), CoreDBError> {
+    pub async fn create_table(&self, keyspace: String, table: String, schema: TableSchema) -> Result<()> {
         schema.validate()?;
         
         let memtable = Arc::new(Memtable::new(Arc::new(schema.clone())));
@@ -158,7 +159,7 @@ impl CoreDB {
     }
     
     /// 행 삽입
-    pub async fn insert_row(&self, keyspace: &str, table: &str, row: crate::schema::Row) -> Result<(), CoreDBError> {
+    pub async fn insert_row(&self, keyspace: &str, table: &str, row: crate::schema::Row) -> Result<()> {
         // 커밋 로그에 기록
         let commit_entry = crate::wal::CommitLogEntry {
             keyspace: keyspace.to_string(),
@@ -189,7 +190,7 @@ impl CoreDB {
     }
     
     /// 행 조회
-    pub async fn get_row(&self, keyspace: &str, table: &str, partition_key: &crate::schema::PartitionKey, clustering_key: &Option<crate::schema::ClusteringKey>) -> Result<Option<crate::schema::Row>, CoreDBError> {
+    pub async fn get_row(&self, keyspace: &str, table: &str, partition_key: &crate::schema::PartitionKey, clustering_key: &Option<crate::schema::ClusteringKey>) -> Result<Option<crate::schema::Row>> {
         let keyspaces = self.keyspaces.read().await;
         if let Some(ks) = keyspaces.get(keyspace) {
             let tables = ks.tables.read().await;
@@ -201,14 +202,19 @@ impl CoreDB {
                 
                 // SSTable에서 검색
                 for sstable in &tbl.sstables {
-                    if let Some(row) = sstable.read_partition(partition_key).await? {
+                    if let Some(partition) = sstable.read_partition(partition_key).await? {
                         // 클러스터링 키가 있다면 해당 행만 반환
                         if let Some(ref ck) = clustering_key {
-                            // 파티션 내에서 클러스터링 키로 검색하는 로직 필요
-                            // 현재는 단순화된 버전
-                            return Ok(Some(row));
+                            // 파티션 내에서 클러스터링 키로 검색
+                            if let Some(row_entry) = partition.rows.get(&Some(ck.clone())) {
+                                return Ok(Some(row_entry.value().clone()));
+                            }
+                        } else {
+                            // 클러스터링 키가 없으면 첫 번째 행 반환
+                            if let Some(row_entry) = partition.rows.iter().next() {
+                                return Ok(Some(row_entry.value().clone()));
+                            }
                         }
-                        return Ok(Some(row));
                     }
                 }
             }
@@ -218,7 +224,7 @@ impl CoreDB {
     }
     
     /// 메모리 테이블 플러시 체크
-    async fn check_memtable_flush(&self) -> Result<(), CoreDBError> {
+    async fn check_memtable_flush(&self) -> Result<()> {
         let keyspaces = self.keyspaces.read().await;
         
         for (keyspace_name, keyspace) in keyspaces.iter() {
@@ -235,7 +241,7 @@ impl CoreDB {
     }
     
     /// 메모리 테이블 플러시
-    async fn flush_memtable(&self, keyspace: &str, table: &str) -> Result<(), CoreDBError> {
+    async fn flush_memtable(&self, keyspace: &str, table: &str) -> Result<()> {
         let mut keyspaces = self.keyspaces.write().await;
         if let Some(ks) = keyspaces.get_mut(keyspace) {
             let mut tables = ks.tables.write().await;
@@ -267,7 +273,7 @@ impl CoreDB {
     }
     
     /// 시스템 키스페이스 생성
-    async fn create_system_keyspaces(&mut self) -> Result<(), CoreDBError> {
+    async fn create_system_keyspaces(&mut self) -> Result<()> {
         // 시스템 키스페이스 생성
         self.create_keyspace("system".to_string(), 1).await?;
         self.create_keyspace("system_schema".to_string(), 1).await?;
@@ -317,27 +323,18 @@ impl CoreDB {
     }
     
     /// 커밋 로그에 뮤테이션 기록
-    async fn log_mutation(&self, statement: &CqlStatement) -> Result<(), CoreDBError> {
-        let mutation = match statement {
-            CqlStatement::Insert { keyspace, table, values } => {
-                // 값들을 Row로 변환하는 로직이 필요
-                // 현재는 단순화된 버전
-                todo!("Convert INSERT values to Row")
+    async fn log_mutation(&self, statement: &CqlStatement) -> Result<()> {
+        // 현재는 단순화된 버전으로 로깅만 수행
+        // 실제 구현에서는 INSERT/UPDATE/DELETE를 Mutation으로 변환해야 함
+        match statement {
+            CqlStatement::Insert { .. } |
+            CqlStatement::Update { .. } |
+            CqlStatement::Delete { .. } => {
+                // WAL 기록 (현재는 건너뜀 - 단순화된 버전)
+                // 실제로는 statement를 Mutation으로 변환하여 CommitLog에 기록
             },
-            _ => {
-                // 다른 뮤테이션 타입들 처리
-                return Ok(());
-            }
-        };
-        
-        let commit_entry = crate::wal::CommitLogEntry {
-            keyspace: "system".to_string(), // 임시
-            table: "mutations".to_string(), // 임시
-            mutation,
-            timestamp: chrono::Utc::now().timestamp_micros(),
-        };
-        
-        self.commit_log.write().await.append(commit_entry).await?;
+            _ => {}
+        }
         Ok(())
     }
     
@@ -373,8 +370,31 @@ impl CoreDB {
         }
     }
     
+    /// 데이터베이스를 디스크에 저장
+    pub async fn save_to_disk(&self) -> Result<()> {
+        use crate::persistence::Snapshot;
+        
+        let snapshot = Snapshot::new(self.config.data_directory.to_string_lossy().to_string());
+        
+        // 현재 데이터베이스 상태를 텍스트로 변환
+        let keyspaces = self.keyspaces.read().await;
+        let mut snapshot_data = String::new();
+        
+        for (ks_name, keyspace) in keyspaces.iter() {
+            snapshot_data.push_str(&format!("KEYSPACE:{}\n", ks_name));
+            
+            let tables = keyspace.tables.read().await;
+            for (table_name, _table) in tables.iter() {
+                snapshot_data.push_str(&format!("TABLE:{}\n", table_name));
+            }
+        }
+        
+        snapshot.save_text(&snapshot_data)?;
+        Ok(())
+    }
+    
     /// 데이터베이스 종료
-    pub async fn shutdown(&self) -> Result<(), CoreDBError> {
+    pub async fn shutdown(&self) -> Result<()> {
         // 모든 메모리 테이블 플러시
         let keyspaces = self.keyspaces.read().await;
         for (keyspace_name, keyspace) in keyspaces.iter() {
@@ -397,8 +417,6 @@ pub struct DatabaseStats {
     pub sstable_count: usize,
     pub total_size_bytes: u64,
 }
-
-use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests {

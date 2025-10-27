@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use coredb::{CoreDB, DatabaseConfig, DatabaseStats};
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 use tokio;
 use tracing::{info, error, warn};
 
@@ -125,10 +126,11 @@ async fn start_server(config: DatabaseConfig, host: String, port: u16) {
     info!("CoreDB server is ready to accept connections");
     
     // 간단한 HTTP 서버 (CQL 프로토콜 대신)
+    let db_arc = Arc::new(db);
     let app = axum::Router::new()
         .route("/query", axum::routing::post(query_handler))
         .route("/stats", axum::routing::get(stats_handler))
-        .with_state(db);
+        .with_state(db_arc);
     
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await.unwrap();
     info!("Server listening on http://{}:{}", host, port);
@@ -309,7 +311,7 @@ async fn init_database(config: DatabaseConfig) {
 
 fn print_help() {
     println!("Available commands:");
-    println!("  CREATE KEYSPACE <name> WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+    println!("  CREATE KEYSPACE <name> WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}");
     println!("  CREATE TABLE <keyspace>.<table> (<columns>)");
     println!("  INSERT INTO <keyspace>.<table> (<columns>) VALUES (<values>)");
     println!("  SELECT <columns> FROM <keyspace>.<table> [WHERE <condition>] [LIMIT <n>]");
