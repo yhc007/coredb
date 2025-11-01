@@ -45,7 +45,7 @@ impl QueryResult {
     }
     
     pub fn is_success(&self) -> bool {
-        matches!(self, QueryResult::Success)
+        matches!(self, QueryResult::Success | QueryResult::Rows(_) | QueryResult::Schema(_))
     }
     
     pub fn is_error(&self) -> bool {

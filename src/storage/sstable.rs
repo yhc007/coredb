@@ -81,6 +81,8 @@ impl SSTable {
         })? as u64;
         
         current_offset += header_size;
+        // 헤더 공간을 실제로 건너뛰고 데이터는 헤더 뒤에서부터 기록되도록 함
+        data_file.seek(SeekFrom::Start(header_size)).await?;
         
         // 파티션별로 정렬하여 SSTable에 쓰기
         let mut partitions = memtable.get_all_partitions();
@@ -96,8 +98,8 @@ impl SSTable {
             // 파티션 데이터 직렬화 및 압축
             let partition_data = Self::serialize_partition(&partition, &compression).await?;
             
-            // 데이터 파일에 쓰기
-            data_file.write_u32(partition_data.len() as u32).await?;
+            // 데이터 파일에 쓰기 (LE)
+            data_file.write_u32_le(partition_data.len() as u32).await?;
             data_file.write_all(&partition_data).await?;
             
             let partition_size = 4 + partition_data.len() as u64;
@@ -195,7 +197,7 @@ impl SSTable {
         
         // Static 컬럼들 직렬화
         let static_data = bincode::serialize(&partition.static_columns)?;
-        data.write_u32(static_data.len() as u32).await?;
+        data.write_u32_le(static_data.len() as u32).await?;
         data.write_all(&static_data).await?;
         
         // 행들 직렬화
@@ -209,10 +211,10 @@ impl SSTable {
             }
         });
         
-        data.write_u32(rows.len() as u32).await?;
+        data.write_u32_le(rows.len() as u32).await?;
         for row in &rows {
             let row_data = bincode::serialize(row)?;
-            data.write_u32(row_data.len() as u32).await?;
+            data.write_u32_le(row_data.len() as u32).await?;
             data.write_all(&row_data).await?;
         }
         
