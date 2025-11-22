@@ -267,6 +267,12 @@ impl TableSchema {
         
         Ok(())
     }
+    pub fn get_column(&self, name: &str) -> Option<&ColumnDefinition> {
+        self.partition_key.iter().find(|c| c.name == name)
+            .or_else(|| self.clustering_key.iter().find(|c| c.name == name))
+            .or_else(|| self.regular_columns.iter().find(|c| c.name == name))
+            .or_else(|| self.static_columns.iter().find(|c| c.name == name))
+    }
 }
 
 #[cfg(test)]

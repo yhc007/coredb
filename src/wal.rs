@@ -66,7 +66,7 @@ impl CommitLog {
         }
         
         // 엔트리 크기 + 데이터 쓰기
-        self.current_segment.write_u32(serialized.len() as u32).await?;
+        self.current_segment.write_u32_le(serialized.len() as u32).await?;
         self.current_segment.write_all(&serialized).await?;
         self.current_segment.flush().await?;
         
@@ -115,13 +115,17 @@ impl CommitLog {
                     
                     // 엔트리 데이터 읽기
                     let mut entry_buf = vec![0u8; entry_size];
-                    file.read_exact(&mut entry_buf).await?;
-                    
-                    // 역직렬화
-                    let entry: CommitLogEntry = bincode::deserialize(&entry_buf)?;
-                    entries.push(entry);
+                    match file.read_exact(&mut entry_buf).await {
+                        Ok(_) => {
+                             // 역직렬화
+                            let entry: CommitLogEntry = bincode::deserialize(&entry_buf)?;
+                            entries.push(entry);
+                        },
+                        Err(e) => return Err(e.into()),
+                    }
                 },
-                Err(_) => break, // 파일 끝
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // 파일 끝
+                Err(e) => return Err(e.into()),
             }
         }
         
@@ -209,6 +213,9 @@ mod tests {
     #[tokio::test]
     async fn test_commit_log_append_and_replay() {
         let temp_dir = std::env::temp_dir().join("coredb_wal_test");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         
         let mut commit_log = CommitLog::new(temp_dir.clone()).await.unwrap();
@@ -237,6 +244,9 @@ mod tests {
     #[tokio::test]
     async fn test_commit_log_segment_rotation() {
         let temp_dir = std::env::temp_dir().join("coredb_wal_rotation_test");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         
         let mut commit_log = CommitLog::new(temp_dir.clone()).await.unwrap();

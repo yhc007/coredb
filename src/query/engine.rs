@@ -5,17 +5,20 @@ use crate::error::*;
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 
+use crate::database::Keyspace;
+use tokio::sync::RwLock;
+
 /// 쿼리 엔진
 pub struct QueryEngine {
-    memtables: HashMap<String, HashMap<String, Arc<Memtable>>>,
-    sstables: HashMap<String, HashMap<String, Vec<Arc<SSTable>>>>,
+    keyspaces: Arc<RwLock<HashMap<String, Keyspace>>>,
+    current_keyspace: Option<String>,
 }
 
 impl QueryEngine {
-    pub fn new() -> Self {
+    pub fn new(keyspaces: Arc<RwLock<HashMap<String, Keyspace>>>) -> Self {
         Self {
-            memtables: HashMap::new(),
-            sstables: HashMap::new(),
+            keyspaces,
+            current_keyspace: None,
         }
     }
     
@@ -52,13 +55,27 @@ impl QueryEngine {
         }
     }
     
-    async fn create_keyspace(&mut self, name: String, _options: crate::query::parser::KeyspaceOptions) -> Result<QueryResult> {
-        // 키스페이스 생성 (단순화된 버전)
-        if !self.memtables.contains_key(&name) {
-            self.memtables.insert(name.clone(), HashMap::new());
-            self.sstables.insert(name, HashMap::new());
+    async fn create_keyspace(&mut self, name: String, options: crate::query::parser::KeyspaceOptions) -> Result<QueryResult> {
+        let mut keyspaces = self.keyspaces.write().await;
+        
+        if keyspaces.contains_key(&name) {
+             return Err(CoreDBError::QueryExecutionError {
+                message: format!("Keyspace '{}' already exists", name),
+            });
         }
-        Ok(QueryResult::success())
+        
+        let keyspace = Keyspace {
+            name: name.clone(),
+            definition: crate::schema::KeyspaceDefinition {
+                name: name.clone(),
+                replication_factor: options.replication_factor,
+                strategy: crate::schema::ReplicationStrategy::SimpleStrategy,
+            },
+            tables: Arc::new(RwLock::new(HashMap::new())),
+        };
+        
+        keyspaces.insert(name, keyspace);
+        Ok(QueryResult::Success)
     }
     
     async fn create_table(&mut self, keyspace: String, name: String, columns: Vec<crate::schema::ColumnDefinition>, partition_key: Vec<String>, clustering_key: Vec<String>, _options: crate::query::parser::TableOptions) -> Result<QueryResult> {
@@ -93,37 +110,84 @@ impl QueryEngine {
         schema.validate()?;
         
         // 메모리 테이블 생성
-        let memtable = Arc::new(Memtable::new(schema));
+        let memtable = Arc::new(Memtable::new(schema.clone()));
         
-        if let Some(tables) = self.memtables.get_mut(&keyspace) {
-            tables.insert(name.clone(), memtable);
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces.get(&keyspace).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Keyspace '{}' does not exist", keyspace),
+        })?;
+        
+        let mut tables = keyspace_struct.tables.write().await;
+        if tables.contains_key(&name) {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Table '{}.{}' already exists", keyspace, name),
+            });
         }
         
-        if let Some(tables) = self.sstables.get_mut(&keyspace) {
-            tables.insert(name, Vec::new());
-        }
+        let table_struct = crate::database::Table {
+            schema: schema,
+            memtables: Vec::new(),
+            sstables: Vec::new(),
+            current_memtable: memtable,
+        };
         
-        Ok(QueryResult::success())
+        tables.insert(name, table_struct);
+        
+        Ok(QueryResult::Success)
     }
     
     async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>) -> Result<QueryResult> {
-        // 테이블 찾기
-        let memtable = self.get_memtable(&keyspace, &table)?;
-        let schema = memtable.table_schema();
+        let keyspace_name = if keyspace.is_empty() {
+            self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
+                message: "No keyspace selected".to_string(),
+            })?
+        } else {
+            keyspace
+        };
+        
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces.get(&keyspace_name).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Keyspace '{}' does not exist", keyspace_name),
+        })?;
+        
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct = tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Table '{}' does not exist", table),
+        })?;
         
         // 파티션 키와 클러스터링 키 추출
-        let (partition_key, clustering_key) = self.extract_keys_from_values(values.clone(), schema)?;
+        let (partition_key, clustering_key) = self.extract_keys_from_values(values.clone(), &table_struct.schema)?;
         
-        // 행 생성
+        // 행 생성 - cells에는 regular columns만 포함
         let mut cells = HashMap::new();
+        
+        // PK/CK 컬럼 이름 수집
+        let mut key_columns = std::collections::HashSet::new();
+        for col in &table_struct.schema.partition_key {
+            key_columns.insert(col.name.clone());
+        }
+        for col in &table_struct.schema.clustering_key {
+            key_columns.insert(col.name.clone());
+        }
+        
         for (column_name, value) in values {
-            let cell = Cell {
-                value,
-                timestamp: chrono::Utc::now().timestamp_micros(),
-                ttl: None,
-                is_deleted: false,
-            };
-            cells.insert(column_name, cell);
+            // 컬럼 존재 여부 확인
+            if table_struct.schema.get_column(&column_name).is_none() {
+                return Err(CoreDBError::QueryExecutionError {
+                    message: format!("Column '{}' does not exist in table '{}'", column_name, table),
+                });
+            }
+            
+            // PK/CK가 아닌 경우만 cells에 추가
+            if !key_columns.contains(&column_name) {
+                let cell = Cell {
+                    value,
+                    timestamp: chrono::Utc::now().timestamp_micros(),
+                    ttl: None,
+                    is_deleted: false,
+                };
+                cells.insert(column_name, cell);
+            }
         }
         
         let row = SchemaRow {
@@ -133,64 +197,125 @@ impl QueryEngine {
             timestamp: chrono::Utc::now().timestamp_micros(),
         };
         
-        // 메모리 테이블에 삽입
-        memtable.put(row)?;
+        // 메모리 테이블에 추가
+        table_struct.current_memtable.put(row)?;
         
-        Ok(QueryResult::success())
+        Ok(QueryResult::Success)
     }
     
     async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>) -> Result<QueryResult> {
-        // 테이블 찾기
-        let memtable = self.get_memtable(&keyspace, &table)?;
-        let schema = memtable.table_schema();
+        let keyspace_name = if keyspace.is_empty() {
+            self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
+                message: "No keyspace selected".to_string(),
+            })?
+        } else {
+            keyspace
+        };
         
-        let mut results = Vec::new();
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces.get(&keyspace_name).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Keyspace '{}' does not exist", keyspace_name),
+        })?;
         
-        if let Some(where_clause) = where_clause {
-            // WHERE 절이 있는 경우
-            if where_clause.conditions.len() == 1 {
-                let condition = &where_clause.conditions[0];
-                if condition.column == schema.partition_key[0].name {
-                    // 파티션 키 조건인 경우
-                    let partition_key = PartitionKey {
-                        components: vec![condition.value.clone()],
-                    };
-                    
-                    if let Some(clustering_condition) = where_clause.conditions.get(1) {
-                        // 클러스터링 키 조건도 있는 경우
-                        let clustering_key = Some(ClusteringKey {
-                            components: vec![clustering_condition.value.clone()],
-                        });
-                        
-                        if let Some(row) = memtable.get(&partition_key, &clustering_key) {
-                            results.push(self.convert_schema_row_to_query_row(row, &columns));
-                        }
-                    } else {
-                        // 파티션 전체 스캔
-                        let partition_rows = memtable.range_scan(&partition_key, &None, &None);
-                        for row in partition_rows {
-                            results.push(self.convert_schema_row_to_query_row(row, &columns));
-                        }
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct = tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Table '{}' does not exist", table),
+        })?;
+        
+        // 파티션 키 추출 (WHERE 절에서)
+        let partition_key = if let Some(ref wc) = where_clause {
+            self.extract_partition_key(&table_struct.schema, wc)?
+        } else {
+            None
+        };
+        
+        let mut result_rows = Vec::new();
+        
+        if let Some(pk) = partition_key {
+            // 1. Memtable 검색
+            let rows = table_struct.current_memtable.range_scan(&pk, &None, &None);
+            for row in rows {
+                result_rows.push(row);
+            }
+            
+            // 2. Immutable Memtables 검색
+            for memtable in &table_struct.memtables {
+                let rows = memtable.range_scan(&pk, &None, &None);
+                for row in rows {
+                    result_rows.push(row);
+                }
+            }
+            
+            // 3. SSTables 검색
+            for sstable in &table_struct.sstables {
+                if let Some(partition) = sstable.read_partition(&pk).await? {
+                    for entry in partition.rows.iter() {
+                        result_rows.push(entry.value().clone());
                     }
                 }
             }
         } else {
-            // WHERE 절이 없는 경우 - 전체 테이블 스캔 (실제로는 비효율적)
-            let all_partitions = memtable.get_all_partitions();
-            for (_, partition) in all_partitions {
-                for row_entry in partition.rows.iter() {
-                    let row = row_entry.value();
-                    results.push(self.convert_schema_row_to_query_row(row.clone(), &columns));
+            // 전체 스캔 (Memtable만 지원 - SSTable 전체 스캔은 복잡함)
+            // 실제 구현에서는 SSTable 전체 스캔도 필요
+            let partitions = table_struct.current_memtable.get_all_partitions();
+            for (_, partition) in partitions {
+                for entry in partition.rows.iter() {
+                    result_rows.push(entry.value().clone());
                 }
             }
         }
         
-        // LIMIT 적용
-        if let Some(limit) = limit {
-            results.truncate(limit as usize);
+        // 중복 제거 및 정렬 (Clustering Key 기준)
+        // ... (생략)
+        
+        // 컬럼 필터링 및 변환
+        let mut query_rows = Vec::new();
+        for row in result_rows {
+            let mut cells = HashMap::new();
+            
+            // 모든 컬럼 값 수집 (PK, CK, Regular)
+            // 1. Partition Key
+            for (i, col_def) in table_struct.schema.partition_key.iter().enumerate() {
+                if let Some(val) = row.partition_key.components.get(i) {
+                    cells.insert(col_def.name.clone(), val.clone());
+                }
+            }
+            
+            // 2. Clustering Key
+            if let Some(ck) = &row.clustering_key {
+                for (i, col_def) in table_struct.schema.clustering_key.iter().enumerate() {
+                    if let Some(val) = ck.components.get(i) {
+                        cells.insert(col_def.name.clone(), val.clone());
+                    }
+                }
+            }
+            
+            // 3. Regular Columns (Cells)
+            for (col, cell) in &row.cells {
+                cells.insert(col.clone(), cell.value.clone());
+            }
+            
+            // 요청된 컬럼만 필터링
+            let mut final_cells = HashMap::new();
+            if columns.contains(&"*".to_string()) {
+                final_cells = cells;
+            } else {
+                for col in &columns {
+                    if let Some(val) = cells.get(col) {
+                        final_cells.insert(col.clone(), val.clone());
+                    }
+                }
+            }
+            
+            query_rows.push(QueryRow { columns: final_cells });
         }
         
-        Ok(QueryResult::rows(results))
+        // LIMIT 적용
+        if let Some(l) = limit {
+            query_rows.truncate(l as usize);
+        }
+        
+        Ok(QueryResult::Rows(query_rows))
     }
     
     async fn update_row(&mut self, _keyspace: String, _table: String, _values: Vec<(String, CassandraValue)>, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
@@ -208,35 +333,79 @@ impl QueryEngine {
     }
     
     async fn drop_table(&mut self, keyspace: String, name: String) -> Result<QueryResult> {
-        if let Some(tables) = self.memtables.get_mut(&keyspace) {
-            tables.remove(&name);
+        let keyspace_name = if keyspace.is_empty() {
+            self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
+                message: "No keyspace selected".to_string(),
+            })?
+        } else {
+            keyspace
+        };
+        
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces.get(&keyspace_name).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Keyspace '{}' does not exist", keyspace_name),
+        })?;
+        
+        let mut tables = keyspace_struct.tables.write().await;
+        if tables.remove(&name).is_none() {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Table '{}' does not exist", name),
+            });
         }
         
-        if let Some(tables) = self.sstables.get_mut(&keyspace) {
-            tables.remove(&name);
-        }
-        
-        Ok(QueryResult::success())
+        Ok(QueryResult::Success)
     }
     
     async fn drop_keyspace(&mut self, name: String) -> Result<QueryResult> {
-        self.memtables.remove(&name);
-        self.sstables.remove(&name);
-        Ok(QueryResult::success())
+        let mut keyspaces = self.keyspaces.write().await;
+        if keyspaces.remove(&name).is_none() {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Keyspace '{}' does not exist", name),
+            });
+        }
+        
+        if let Some(current) = &self.current_keyspace {
+            if current == &name {
+                self.current_keyspace = None;
+            }
+        }
+        
+        Ok(QueryResult::Success)
     }
     
-    async fn use_keyspace(&mut self, _keyspace: String) -> Result<QueryResult> {
-        // 현재 키스페이스 설정 (단순화된 버전)
-        Ok(QueryResult::success())
+    async fn use_keyspace(&mut self, keyspace: String) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        if !keyspaces.contains_key(&keyspace) {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Keyspace '{}' does not exist", keyspace),
+            });
+        }
+        
+        self.current_keyspace = Some(keyspace);
+        Ok(QueryResult::Success)
     }
     
-    fn get_memtable(&self, keyspace: &str, table: &str) -> Result<Arc<Memtable>> {
-        self.memtables
-            .get(keyspace)
-            .ok_or_else(|| CoreDBError::KeyspaceNotFound { keyspace: keyspace.to_string() })?
-            .get(table)
-            .ok_or_else(|| CoreDBError::TableNotFound { table: table.to_string() })
-            .map(|m| m.clone())
+    fn extract_partition_key(&self, schema: &TableSchema, where_clause: &crate::query::parser::WhereClause) -> Result<Option<PartitionKey>> {
+        let mut partition_components = Vec::new();
+        
+        // WHERE 절에서 파티션 키 컬럼 찾기
+        // 간단한 구현: 파티션 키의 첫 번째 컬럼만 확인 (복합 파티션 키 미지원)
+        if let Some(first_pk) = schema.partition_key.first() {
+            for condition in &where_clause.conditions {
+                if condition.column == first_pk.name {
+                    partition_components.push(condition.value.clone());
+                    break;
+                }
+            }
+        }
+        
+        if partition_components.is_empty() {
+            return Ok(None);
+        }
+        
+        Ok(Some(PartitionKey {
+            components: partition_components,
+        }))
     }
     
     fn extract_keys_from_values(&self, values: Vec<(String, CassandraValue)>, schema: &TableSchema) -> Result<(PartitionKey, Option<ClusteringKey>)> {
@@ -284,41 +453,9 @@ impl QueryEngine {
         Ok((partition_key, clustering_key))
     }
     
-    fn convert_schema_row_to_query_row(&self, row: SchemaRow, requested_columns: &[String]) -> QueryRow {
-        let mut query_row = QueryRow::new();
-        
-        if requested_columns.contains(&"*".to_string()) {
-            // 모든 컬럼 반환
-            for (column_name, cell) in row.cells {
-                query_row = query_row.with_column(column_name, cell.value);
-            }
-        } else {
-            // 요청된 컬럼만 반환
-            for column_name in requested_columns {
-                if let Some(cell) = row.cells.get(column_name) {
-                    query_row = query_row.with_column(column_name.clone(), cell.value.clone());
-                }
-            }
-        }
-        
-        query_row
-    }
+
     
-    /// 메모리 테이블에 SSTable 추가
-    pub fn add_sstable(&mut self, keyspace: String, table: String, sstable: Arc<SSTable>) {
-        if let Some(tables) = self.sstables.get_mut(&keyspace) {
-            if let Some(sstables) = tables.get_mut(&table) {
-                sstables.push(sstable);
-            }
-        }
-    }
-    
-    /// 메모리 테이블 교체
-    pub fn replace_memtable(&mut self, keyspace: String, table: String, memtable: Arc<Memtable>) {
-        if let Some(tables) = self.memtables.get_mut(&keyspace) {
-            tables.insert(table, memtable);
-        }
-    }
+
 }
 
 #[cfg(test)]
@@ -328,7 +465,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_create_keyspace_and_table() {
-        let mut engine = QueryEngine::new();
+        let keyspaces = Arc::new(RwLock::new(HashMap::new()));
+        let mut engine = QueryEngine::new(keyspaces);
         
         // 키스페이스 생성
         let create_ks = CqlStatement::CreateKeyspace {
@@ -373,7 +511,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_insert_and_select() {
-        let mut engine = QueryEngine::new();
+        let keyspaces = Arc::new(RwLock::new(HashMap::new()));
+        let mut engine = QueryEngine::new(keyspaces);
         
         // 키스페이스와 테이블 생성
         engine.execute(CqlStatement::CreateKeyspace {

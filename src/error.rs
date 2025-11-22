@@ -44,6 +44,9 @@ pub enum CoreDBError {
     #[error("Query parsing error: {message}")]
     QueryParsingError { message: String },
     
+    #[error("Query execution error: {message}")]
+    QueryExecutionError { message: String },
+    
     #[error("Invalid data type: {message}")]
     InvalidDataType { message: String },
     

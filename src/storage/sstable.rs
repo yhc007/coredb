@@ -80,7 +80,21 @@ impl SSTable {
             summary_index_offset: 0,
         })? as u64;
         
-        current_offset += header_size;
+        // Write dummy header to reserve space and advance file pointer
+        let dummy_header = SSTableHeader {
+            version: 1,
+            compression: CompressionType::None,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            partition_count: 0,
+            bloom_filter_offset: 0,
+            partition_index_offset: 0,
+            summary_index_offset: 0,
+        };
+        let dummy_header_data = bincode::serialize(&dummy_header)?;
+        data_file.write_all(&dummy_header_data).await?;
+        
+        current_offset = dummy_header_data.len() as u64;
         
         // 파티션별로 정렬하여 SSTable에 쓰기
         let mut partitions = memtable.get_all_partitions();
@@ -97,7 +111,7 @@ impl SSTable {
             let partition_data = Self::serialize_partition(&partition, &compression).await?;
             
             // 데이터 파일에 쓰기
-            data_file.write_u32(partition_data.len() as u32).await?;
+            data_file.write_u32_le(partition_data.len() as u32).await?;
             data_file.write_all(&partition_data).await?;
             
             let partition_size = 4 + partition_data.len() as u64;
@@ -195,7 +209,7 @@ impl SSTable {
         
         // Static 컬럼들 직렬화
         let static_data = bincode::serialize(&partition.static_columns)?;
-        data.write_u32(static_data.len() as u32).await?;
+        data.write_u32_le(static_data.len() as u32).await?;
         data.write_all(&static_data).await?;
         
         // 행들 직렬화
@@ -209,10 +223,10 @@ impl SSTable {
             }
         });
         
-        data.write_u32(rows.len() as u32).await?;
+        data.write_u32_le(rows.len() as u32).await?;
         for row in &rows {
             let row_data = bincode::serialize(row)?;
-            data.write_u32(row_data.len() as u32).await?;
+            data.write_u32_le(row_data.len() as u32).await?;
             data.write_all(&row_data).await?;
         }
         
@@ -362,6 +376,9 @@ mod tests {
     #[tokio::test]
     async fn test_sstable_creation_and_read() {
         let temp_dir = std::env::temp_dir().join("coredb_test");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         
         let schema = create_test_schema();

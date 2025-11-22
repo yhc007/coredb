@@ -66,8 +66,10 @@ impl CoreDB {
         tokio::fs::create_dir_all(&config.data_directory).await?;
         tokio::fs::create_dir_all(&config.commitlog_directory).await?;
         
+        let keyspaces = Arc::new(RwLock::new(HashMap::new()));
+        
         let commit_log = CommitLog::new(config.commitlog_directory.clone()).await?;
-        let query_engine = QueryEngine::new();
+        let query_engine = QueryEngine::new(keyspaces.clone());
         
         let compaction_config = CompactionConfig {
             throughput_mb_per_sec: config.compaction_throughput_mb_per_sec,
@@ -82,7 +84,7 @@ impl CoreDB {
         let compaction_manager = CompactionManager::new(compaction_config);
         
         let mut db = Self {
-            keyspaces: Arc::new(RwLock::new(HashMap::new())),
+            keyspaces,
             commit_log: Arc::new(RwLock::new(commit_log)),
             query_engine: Arc::new(RwLock::new(query_engine)),
             config,
