@@ -149,7 +149,7 @@ impl CqlParser {
     
     fn parse_create_table(query: &str) -> Result<CqlStatement> {
         // 매우 간단한 파싱 - 실제로는 더 정교한 파서가 필요
-        let re = regex::Regex::new(r"CREATE\s+TABLE\s+(\w+)\.(\w+)\s*\((.*)\)")?;
+        let re = regex::Regex::new(r"(?i)CREATE\s+TABLE\s+(\w+)\.(\w+)\s*\(([\s\S]*)\)")?;
         
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
@@ -203,7 +203,7 @@ impl CqlParser {
     
     fn parse_insert(query: &str) -> Result<CqlStatement> {
         // 간단한 INSERT 파싱
-        let re = regex::Regex::new(r"INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)")?;
+        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)")?;
         
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
@@ -240,7 +240,7 @@ impl CqlParser {
     
     fn parse_select(query: &str) -> Result<CqlStatement> {
         // 간단한 SELECT 파싱
-        let re = regex::Regex::new(r"SELECT\s+(.+?)\s+FROM\s+(\w+)\.(\w+)")?;
+        let re = regex::Regex::new(r"(?i)SELECT\s+(.+?)\s+FROM\s+(\w+)\.(\w+)")?;
         
         if let Some(caps) = re.captures(query) {
             let columns_str = caps.get(1).unwrap().as_str();

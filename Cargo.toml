@@ -13,6 +13,10 @@ path = "src/simple_main.rs"
 name = "persistent_db"
 path = "persistent_db.rs"
 
+[[bin]]
+name = "cqlsh"
+path = "src/bin/cqlsh.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -37,6 +41,9 @@ regex = "1.0"
 axum = "0.7"
 tower = "0.4"
 tower-http = "0.5"
+rustyline = "14.0"
+prettytable-rs = "0.10"
+colored = "2.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
