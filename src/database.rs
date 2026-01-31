@@ -94,15 +94,124 @@ impl CoreDB {
         // 시스템 키스페이스 초기화
         db.create_system_keyspaces().await?;
         
+        // 기존 데이터 로드
+        db.load_existing_data().await?;
+        
         // 백그라운드 작업 시작
         db.start_background_tasks().await;
         
         Ok(db)
     }
     
+    /// 기존 SSTable 데이터 로드
+    async fn load_existing_data(&mut self) -> Result<()> {
+        use tokio::fs;
+        
+        let data_dir = &self.config.data_directory;
+        
+        // data 디렉토리가 없으면 스킵
+        if !data_dir.exists() {
+            return Ok(());
+        }
+        
+        let mut entries = fs::read_dir(data_dir).await?;
+        
+        while let Some(entry) = entries.next_entry().await? {
+            let keyspace_name = entry.file_name().to_string_lossy().to_string();
+            
+            // 시스템 키스페이스는 스킵
+            if keyspace_name.starts_with("system") {
+                continue;
+            }
+            
+            let keyspace_path = entry.path();
+            if !keyspace_path.is_dir() {
+                continue;
+            }
+            
+            // 키스페이스 생성 (없으면)
+            self.create_keyspace(keyspace_name.clone(), 1).await.ok();
+            
+            // 테이블 디렉토리 스캔
+            let mut table_entries = fs::read_dir(&keyspace_path).await?;
+            
+            while let Some(table_entry) = table_entries.next_entry().await? {
+                let table_name = table_entry.file_name().to_string_lossy().to_string();
+                let table_path = table_entry.path();
+                
+                if !table_path.is_dir() {
+                    continue;
+                }
+                
+                // SSTable 파일 로드
+                let mut sstable_files = fs::read_dir(&table_path).await?;
+                let mut sstables: Vec<Arc<SSTable>> = Vec::new();
+                
+                while let Some(file_entry) = sstable_files.next_entry().await? {
+                    let file_name = file_entry.file_name().to_string_lossy().to_string();
+                    
+                    if file_name.ends_with("-Data.db") {
+                        if let Ok(sstable) = SSTable::open(&file_entry.path()).await {
+                            sstables.push(Arc::new(sstable));
+                        }
+                    }
+                }
+                
+                // 스키마 로드 및 테이블 생성
+                if let Ok(Some(schema)) = self.load_table_schema(&keyspace_name, &table_name).await {
+                    let schema_arc = Arc::new(schema);
+                    let memtable = Memtable::new(schema_arc.clone());
+                    
+                    // SSTable 데이터를 Memtable에 로드 (재시작 시 데이터 복구)
+                    let mut loaded_count = 0;
+                    for sstable in &sstables {
+                        
+                        for pk in sstable.partition_index.keys() {
+                            match sstable.read_partition(pk).await {
+                                Ok(Some(partition)) => {
+                                    
+                                    for entry in partition.rows.iter() {
+                                        let _ = memtable.put(entry.value().clone());
+                                        loaded_count += 1;
+                                    }
+                                }
+                                Ok(None) => eprintln!("[load] Partition not found"),
+                                Err(e) => eprintln!("[load] Error reading partition: {}", e),
+                            }
+                        }
+                    }
+                    
+                    
+                    // 테이블 생성
+                    let table_struct = Table {
+                        schema: schema_arc,
+                        memtables: Vec::new(),
+                        sstables: sstables.clone(),
+                        current_memtable: Arc::new(memtable),
+                    };
+                    
+                    let mut keyspaces = self.keyspaces.write().await;
+                    if let Some(ks) = keyspaces.get_mut(&keyspace_name) {
+                        let mut tables = ks.tables.write().await;
+                        tables.insert(table_name.clone(), table_struct);
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// CQL 쿼리 실행
     pub async fn execute_cql(&self, query: &str) -> Result<QueryResult> {
         let parsed = crate::query::parser::CqlParser::parse(query)?;
+        
+        // CREATE TABLE인 경우 스키마 저장 정보 추출
+        let create_table_info = if let CqlStatement::CreateTable { ref keyspace, ref name, ref columns, ref partition_key, ref clustering_key, .. } = parsed {
+            Some((keyspace.clone(), name.clone(), columns.clone(), partition_key.clone(), clustering_key.clone()))
+        } else {
+            None
+        };
         
         // 커밋 로그에 기록 (변경 작업인 경우)
         if self.is_mutation(&parsed) {
@@ -112,6 +221,40 @@ impl CoreDB {
         // 쿼리 엔진에서 실행
         let mut engine = self.query_engine.write().await;
         let result = engine.execute(parsed).await?;
+        
+        // CREATE TABLE 성공 후 스키마 저장
+        if let Some((keyspace, table_name, columns, partition_key, clustering_key)) = create_table_info {
+            if matches!(result, QueryResult::Success) {
+                // 스키마 재구성
+                let mut pk_columns = Vec::new();
+                let mut ck_columns = Vec::new();
+                let mut regular_columns = Vec::new();
+                let mut static_columns = Vec::new();
+                
+                for column in columns {
+                    if partition_key.contains(&column.name) {
+                        pk_columns.push(column);
+                    } else if clustering_key.contains(&column.name) {
+                        ck_columns.push(column);
+                    } else if column.is_static {
+                        static_columns.push(column);
+                    } else {
+                        regular_columns.push(column);
+                    }
+                }
+                
+                let schema = TableSchema::new(
+                    table_name.clone(),
+                    keyspace.clone(),
+                    pk_columns,
+                    ck_columns,
+                    regular_columns,
+                    static_columns,
+                );
+                
+                self.save_table_schema(&keyspace, &table_name, &schema).await?;
+            }
+        }
         
         // 메모리 테이블 플러시 체크
         self.check_memtable_flush().await?;
@@ -143,7 +286,7 @@ impl CoreDB {
         
         let memtable = Arc::new(Memtable::new(Arc::new(schema.clone())));
         let table_struct = Table {
-            schema: Arc::new(schema),
+            schema: Arc::new(schema.clone()),
             memtables: Vec::new(),
             sstables: Vec::new(),
             current_memtable: memtable,
@@ -152,12 +295,44 @@ impl CoreDB {
         let keyspaces = self.keyspaces.read().await;
         if let Some(ks) = keyspaces.get(&keyspace) {
             let mut tables = ks.tables.write().await;
-            tables.insert(table, table_struct);
+            tables.insert(table.clone(), table_struct);
         } else {
-            return Err(CoreDBError::KeyspaceNotFound { keyspace });
+            return Err(CoreDBError::KeyspaceNotFound { keyspace: keyspace.clone() });
         }
         
+        // 스키마를 파일로 저장
+        self.save_table_schema(&keyspace, &table, &schema).await?;
+        
         Ok(())
+    }
+    
+    /// 테이블 스키마 저장
+    async fn save_table_schema(&self, keyspace: &str, table: &str, schema: &TableSchema) -> Result<()> {
+        let schema_dir = self.config.data_directory.join(keyspace).join(table);
+        tokio::fs::create_dir_all(&schema_dir).await?;
+        
+        let schema_path = schema_dir.join("schema.json");
+        let schema_json = serde_json::to_string_pretty(schema)?;
+        tokio::fs::write(&schema_path, schema_json).await?;
+        
+        Ok(())
+    }
+    
+    /// 테이블 스키마 로드
+    async fn load_table_schema(&self, keyspace: &str, table: &str) -> Result<Option<TableSchema>> {
+        let schema_path = self.config.data_directory
+            .join(keyspace)
+            .join(table)
+            .join("schema.json");
+        
+        if !schema_path.exists() {
+            return Ok(None);
+        }
+        
+        let schema_json = tokio::fs::read_to_string(&schema_path).await?;
+        let schema: TableSchema = serde_json::from_str(&schema_json)?;
+        
+        Ok(Some(schema))
     }
     
     /// 행 삽입
@@ -269,6 +444,31 @@ impl CoreDB {
                 // 컴팩션 트리거
                 self.compaction_manager.schedule_compaction(keyspace, table).await;
             }
+        }
+        
+        Ok(())
+    }
+    
+    /// 모든 메모리 테이블 강제 플러시 (종료 전 호출)
+    pub async fn flush_all(&self) -> Result<()> {
+        // 먼저 flush할 테이블 목록 수집
+        let mut to_flush: Vec<(String, String)> = Vec::new();
+        
+        {
+            let keyspaces = self.keyspaces.read().await;
+            for (keyspace_name, keyspace) in keyspaces.iter() {
+                let tables = keyspace.tables.read().await;
+                for (table_name, table) in tables.iter() {
+                    if table.current_memtable.size_bytes() > 0 {
+                        to_flush.push((keyspace_name.clone(), table_name.clone()));
+                    }
+                }
+            }
+        }
+        
+        // 락 해제 후 flush 실행
+        for (keyspace, table) in to_flush {
+            self.flush_memtable(&keyspace, &table).await?;
         }
         
         Ok(())

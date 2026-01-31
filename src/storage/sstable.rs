@@ -158,6 +158,14 @@ impl SSTable {
         data_file.write_all(&header_data).await?;
         data_file.sync_all().await?;
         
+        // partition_index를 별도 JSON 파일로 저장 (안정적인 복구용)
+        let index_file_path = base_dir.join(format!("{}-Index.json", sstable_id));
+        let index_vec: Vec<(PartitionKey, u64)> = partition_index.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let index_json = serde_json::to_string(&index_vec)?;
+        tokio::fs::write(&index_file_path, index_json).await?;
+        
         Ok(SSTable {
             id: sstable_id,
             file_path: data_file_path,
@@ -171,12 +179,88 @@ impl SSTable {
         })
     }
     
+    /// 기존 SSTable 파일 열기
+    pub async fn open(file_path: &std::path::Path) -> Result<Self> {
+        let mut file = File::open(file_path).await?;
+        
+        // 헤더 읽기
+        let mut header_buf = vec![0u8; 128]; // 충분한 크기
+        file.read_exact(&mut header_buf).await.ok();
+        file.seek(SeekFrom::Start(0)).await?;
+        
+        // 헤더 크기 추정 (고정 크기 사용)
+        let header_size = std::mem::size_of::<SSTableHeader>() + 16; // 여유 공간
+        let mut header_data = vec![0u8; header_size];
+        file.read_exact(&mut header_data).await.ok();
+        
+        let header: SSTableHeader = bincode::deserialize(&header_data)
+            .map_err(|e| CoreDBError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+        
+        // Bloom filter 읽기
+        file.seek(SeekFrom::Start(header.bloom_filter_offset)).await?;
+        let bloom_filter = BloomFilter::new(1000, 0.01); // 기본값으로 생성 (실제로는 역직렬화 필요)
+        
+        // Partition index 읽기 (JSON 파일 우선)
+        let index_file_path = file_path.with_file_name(
+            file_path.file_stem().unwrap().to_string_lossy().replace("-Data", "-Index") + ".json"
+        );
+        
+        let partition_index: BTreeMap<PartitionKey, u64> = if index_file_path.exists() {
+            // JSON 파일에서 로드 (안정적)
+            let index_json = tokio::fs::read_to_string(&index_file_path).await?;
+            let index_vec: Vec<(PartitionKey, u64)> = serde_json::from_str(&index_json).unwrap_or_default();
+            
+            index_vec.into_iter().collect()
+        } else {
+            // 레거시: bincode에서 로드 시도
+            file.seek(SeekFrom::Start(header.partition_index_offset)).await?;
+            let mut index_buf = Vec::new();
+            let summary_size = if header.summary_index_offset > header.partition_index_offset {
+                (header.summary_index_offset - header.partition_index_offset) as usize
+            } else {
+                1024 * 1024
+            };
+            index_buf.resize(summary_size, 0);
+            file.read_exact(&mut index_buf).await.ok();
+            bincode::deserialize(&index_buf).unwrap_or_default()
+        };
+        
+        // Summary index 읽기
+        file.seek(SeekFrom::Start(header.summary_index_offset)).await?;
+        let mut summary_buf = vec![0u8; 4096];
+        file.read_exact(&mut summary_buf).await.ok();
+        let summary_index: BTreeMap<PartitionKey, u64> = bincode::deserialize(&summary_buf)
+            .unwrap_or_default();
+        
+        // 파일 크기
+        let metadata = tokio::fs::metadata(file_path).await?;
+        
+        // ID 추출 (파일 이름에서)
+        let id = file_path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.replace("-Data", ""))
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        
+        Ok(SSTable {
+            id,
+            file_path: file_path.to_path_buf(),
+            bloom_filter,
+            partition_index,
+            summary_index,
+            min_timestamp: header.min_timestamp,
+            max_timestamp: header.max_timestamp,
+            compression: header.compression,
+            size_bytes: metadata.len(),
+        })
+    }
+    
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
-        // 1. 블룸 필터 체크
-        if !self.bloom_filter.might_contain(partition_key) {
-            return Ok(None);
-        }
+        // 1. 블룸 필터 체크 (스킵 - open()에서 로드 안 됨)
+        // TODO: bloom_filter도 별도 파일로 저장/로드
+        // if !self.bloom_filter.might_contain(partition_key) {
+        //     return Ok(None);
+        // }
         
         // 2. 파티션 인덱스에서 오프셋 찾기
         let offset = match self.partition_index.get(partition_key) {

@@ -129,7 +129,11 @@ async fn start_server(config: DatabaseConfig, host: String, port: u16) {
     let db_arc = Arc::new(db);
     let app = axum::Router::new()
         .route("/query", axum::routing::post(query_handler))
+        .route("/api/query", axum::routing::post(query_handler))
         .route("/stats", axum::routing::get(stats_handler))
+        .route("/api/stats", axum::routing::get(stats_handler))
+        .route("/flush", axum::routing::post(flush_handler))
+        .route("/api/flush", axum::routing::post(flush_handler))
         .with_state(db_arc);
     
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await.unwrap();
@@ -378,6 +382,25 @@ async fn stats_handler(
         "sstables": stats.sstable_count,
         "total_size_bytes": stats.total_size_bytes
     }))
+}
+
+async fn flush_handler(
+    axum::extract::State(db): axum::extract::State<std::sync::Arc<CoreDB>>,
+) -> axum::response::Json<serde_json::Value> {
+    match db.flush_all().await {
+        Ok(_) => {
+            axum::response::Json(serde_json::json!({
+                "status": "success",
+                "message": "All memtables flushed to disk"
+            }))
+        },
+        Err(e) => {
+            axum::response::Json(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            }))
+        }
+    }
 }
 
 // Cargo.toml에 필요한 의존성 추가

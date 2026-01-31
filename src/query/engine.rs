@@ -255,18 +255,52 @@ impl QueryEngine {
                 }
             }
         } else {
-            // 전체 스캔 (Memtable만 지원 - SSTable 전체 스캔은 복잡함)
-            // 실제 구현에서는 SSTable 전체 스캔도 필요
+            // 전체 스캔
+            // 1. Current Memtable
             let partitions = table_struct.current_memtable.get_all_partitions();
             for (_, partition) in partitions {
                 for entry in partition.rows.iter() {
                     result_rows.push(entry.value().clone());
                 }
             }
+            
+            // 2. Immutable Memtables
+            for memtable in &table_struct.memtables {
+                let partitions = memtable.get_all_partitions();
+                for (_, partition) in partitions {
+                    for entry in partition.rows.iter() {
+                        result_rows.push(entry.value().clone());
+                    }
+                }
+            }
+            
+            // 3. SSTables - full scan
+            for sstable in &table_struct.sstables {
+                for pk in sstable.partition_index.keys() {
+                    if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                        for entry in partition.rows.iter() {
+                            result_rows.push(entry.value().clone());
+                        }
+                    }
+                }
+            }
         }
         
-        // 중복 제거 및 정렬 (Clustering Key 기준)
-        // ... (생략)
+        // 중복 제거 (partition_key + clustering_key 기준)
+        // 최신 timestamp 우선 - BTreeMap 사용 (PartitionKey는 Ord 구현됨)
+        let mut dedup_map: BTreeMap<(PartitionKey, Option<ClusteringKey>), SchemaRow> = BTreeMap::new();
+        for row in result_rows {
+            let key = (row.partition_key.clone(), row.clustering_key.clone());
+            match dedup_map.get(&key) {
+                Some(existing) if existing.timestamp >= row.timestamp => {
+                    // 기존 row가 더 최신이면 스킵
+                }
+                _ => {
+                    dedup_map.insert(key, row);
+                }
+            }
+        }
+        let result_rows: Vec<SchemaRow> = dedup_map.into_values().collect();
         
         // 컬럼 필터링 및 변환
         let mut query_rows = Vec::new();
