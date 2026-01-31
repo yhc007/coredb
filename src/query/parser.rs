@@ -203,7 +203,7 @@ impl CqlParser {
     
     fn parse_insert(query: &str) -> Result<CqlStatement> {
         // 간단한 INSERT 파싱
-        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)")?;
+        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+)\)\s*$")?;
         
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
@@ -212,7 +212,7 @@ impl CqlParser {
             let values_str = caps.get(4).unwrap().as_str();
             
             let columns: Vec<&str> = columns_str.split(',').map(|s| s.trim()).collect();
-            let values: Vec<&str> = values_str.split(',').map(|s| s.trim()).collect();
+            let values = Self::split_values_respecting_quotes(values_str);
             
             if columns.len() != values.len() {
                 return Err(CoreDBError::QueryParsingError {
@@ -236,6 +236,46 @@ impl CqlParser {
                 message: "Invalid INSERT syntax".to_string(),
             })
         }
+    }
+    
+    /// Split VALUES by comma, but respect quoted strings
+    fn split_values_respecting_quotes(s: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut chars = s.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' if !in_quotes => {
+                    in_quotes = true;
+                    current.push(c);
+                }
+                '\'' if in_quotes => {
+                    current.push(c);
+                    // Check for escaped quote ('')
+                    if chars.peek() == Some(&'\'') {
+                        current.push(chars.next().unwrap());
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                ',' if !in_quotes => {
+                    values.push(current.trim().to_string());
+                    current = String::new();
+                }
+                _ => {
+                    current.push(c);
+                }
+            }
+        }
+        
+        // Don't forget the last value
+        if !current.is_empty() {
+            values.push(current.trim().to_string());
+        }
+        
+        values
     }
     
     fn parse_select(query: &str) -> Result<CqlStatement> {
