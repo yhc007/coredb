@@ -1,3 +1,17 @@
+# Build artifacts
+target/
 data/
 commitlog/
-target/
+
+# Benchmark data
+bench_commitlog/
+sam_commitlog/
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
