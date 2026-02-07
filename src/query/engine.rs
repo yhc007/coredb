@@ -301,6 +301,56 @@ impl QueryEngine {
             }
         }
         let result_rows: Vec<SchemaRow> = dedup_map.into_values().collect();
+
+        // WHERE 조건 필터링 (non-PK 조건들)
+        let result_rows: Vec<SchemaRow> = if let Some(ref wc) = where_clause {
+            result_rows.into_iter().filter(|row| {
+                for condition in &wc.conditions {
+                    // 해당 컬럼의 값 찾기
+                    let value = {
+                        // 1. PK에서 찾기
+                        let mut found: Option<&CassandraValue> = None;
+                        for (i, col_def) in table_struct.schema.partition_key.iter().enumerate() {
+                            if col_def.name == condition.column {
+                                found = row.partition_key.components.get(i);
+                                break;
+                            }
+                        }
+                        // 2. CK에서 찾기
+                        if found.is_none() {
+                            if let Some(ck) = &row.clustering_key {
+                                for (i, col_def) in table_struct.schema.clustering_key.iter().enumerate() {
+                                    if col_def.name == condition.column {
+                                        found = ck.components.get(i);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // 3. Regular columns에서 찾기
+                        if found.is_none() {
+                            if let Some(cell) = row.cells.get(&condition.column) {
+                                found = Some(&cell.value);
+                            }
+                        }
+                        found
+                    };
+                    
+                    // 값이 없거나 조건 불일치면 false
+                    match value {
+                        Some(v) => {
+                            if !Self::matches_condition(v, condition) {
+                                return false;
+                            }
+                        },
+                        None => return false,
+                    }
+                }
+                true
+            }).collect()
+        } else {
+            result_rows
+        };
         
         // 컬럼 필터링 및 변환
         let mut query_rows = Vec::new();
@@ -490,6 +540,57 @@ impl QueryEngine {
 
     
 
+
+    /// 조건이 값과 매칭되는지 확인
+    fn matches_condition(value: &CassandraValue, condition: &crate::query::parser::Condition) -> bool {
+        use crate::query::parser::ComparisonOperator;
+        
+        match &condition.operator {
+            ComparisonOperator::Equal => value == &condition.value,
+            ComparisonOperator::NotEqual => value != &condition.value,
+            ComparisonOperator::GreaterThan => {
+                Self::compare_values(value, &condition.value).map(|o| o == std::cmp::Ordering::Greater).unwrap_or(false)
+            },
+            ComparisonOperator::GreaterThanOrEqual => {
+                Self::compare_values(value, &condition.value).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false)
+            },
+            ComparisonOperator::LessThan => {
+                Self::compare_values(value, &condition.value).map(|o| o == std::cmp::Ordering::Less).unwrap_or(false)
+            },
+            ComparisonOperator::LessThanOrEqual => {
+                Self::compare_values(value, &condition.value).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false)
+            },
+            ComparisonOperator::Like => {
+                if let (CassandraValue::Text(text), CassandraValue::Text(pattern)) = (value, &condition.value) {
+                    let regex_pattern = pattern
+                        .replace('%', ".*")
+                        .replace('_', ".");
+                    regex::Regex::new(&format!("^{}$", regex_pattern))
+                        .map(|re| re.is_match(text))
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            },
+            ComparisonOperator::In => {
+                value == &condition.value
+            },
+        }
+    }
+    
+    /// 두 값 비교
+    fn compare_values(a: &CassandraValue, b: &CassandraValue) -> Option<std::cmp::Ordering> {
+        match (a, b) {
+            (CassandraValue::Int(a), CassandraValue::Int(b)) => Some(a.cmp(b)),
+            (CassandraValue::BigInt(a), CassandraValue::BigInt(b)) => Some(a.cmp(b)),
+            (CassandraValue::Double(a), CassandraValue::Double(b)) => a.partial_cmp(b),
+            (CassandraValue::Text(a), CassandraValue::Text(b)) => Some(a.cmp(b)),
+            (CassandraValue::Timestamp(a), CassandraValue::Timestamp(b)) => Some(a.cmp(b)),
+            (CassandraValue::Int(a), CassandraValue::BigInt(b)) => Some((*a as i64).cmp(b)),
+            (CassandraValue::BigInt(a), CassandraValue::Int(b)) => Some(a.cmp(&(*b as i64))),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

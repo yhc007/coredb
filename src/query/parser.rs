@@ -379,26 +379,105 @@ impl CqlParser {
     }
     
     fn parse_where_clause(query: &str) -> Result<WhereClause> {
-        let re = regex::Regex::new(r"WHERE\s+(\w+)\s*=\s*([^\\s]+)")?;
-        
-        if let Some(caps) = re.captures(query) {
-            let column = caps.get(1).unwrap().as_str().to_string();
-            let value_str = caps.get(2).unwrap().as_str();
-            let value = Self::parse_value(value_str)?;
-            
-            Ok(WhereClause {
-                conditions: vec![Condition {
-                    column,
-                    operator: ComparisonOperator::Equal,
-                    value,
-                }],
-            })
+        // WHERE 이후 부분 추출 (LIMIT, ORDER BY 등은 제외)
+        let where_re = regex::Regex::new(r"(?i)WHERE\s+(.+?)(?:\s+LIMIT|\s+ORDER|\s+ALLOW|\s*$)")?;
+        let where_part = if let Some(caps) = where_re.captures(query) {
+            caps.get(1).unwrap().as_str().to_string()
         } else {
-            Err(CoreDBError::QueryParsingError {
-                message: "Invalid WHERE clause syntax".to_string(),
-            })
+            // 간단한 fallback
+            let idx = query.to_uppercase().find("WHERE").unwrap();
+            query[idx + 5..].to_string()
+        };
+        
+        let mut conditions = Vec::new();
+        
+        // AND로 분리된 조건들 파싱 (대소문자 무시)
+        let and_re = regex::Regex::new(r"(?i)\s+AND\s+")?;
+        for cond_str in and_re.split(&where_part) {
+            let cond_str = cond_str.trim();
+            if cond_str.is_empty() {
+                continue;
+            }
+            
+            // 연산자 매칭 (순서 중요: >= 먼저, > 나중에)
+            let operators = [
+                ("!=", ComparisonOperator::NotEqual),
+                ("<>", ComparisonOperator::NotEqual),
+                (">=", ComparisonOperator::GreaterThanOrEqual),
+                ("<=", ComparisonOperator::LessThanOrEqual),
+                (">", ComparisonOperator::GreaterThan),
+                ("<", ComparisonOperator::LessThan),
+                ("=", ComparisonOperator::Equal),
+            ];
+            
+            let mut matched = false;
+            for (op_str, op) in operators {
+                if let Some(idx) = cond_str.find(op_str) {
+                    let column = cond_str[..idx].trim().to_string();
+                    let value_str = cond_str[idx + op_str.len()..].trim();
+                    let value = Self::parse_value(value_str)?;
+                    
+                    conditions.push(Condition {
+                        column,
+                        operator: op,
+                        value,
+                    });
+                    matched = true;
+                    break;
+                }
+            }
+            
+            // LIKE 연산자
+            if !matched {
+                let like_re = regex::Regex::new(r"(?i)(\w+)\s+LIKE\s+(.+)")?;
+                if let Some(caps) = like_re.captures(cond_str) {
+                    let column = caps.get(1).unwrap().as_str().to_string();
+                    let value_str = caps.get(2).unwrap().as_str().trim();
+                    let value = Self::parse_value(value_str)?;
+                    
+                    conditions.push(Condition {
+                        column,
+                        operator: ComparisonOperator::Like,
+                        value,
+                    });
+                    matched = true;
+                }
+            }
+            
+            // IN 연산자
+            if !matched {
+                let in_re = regex::Regex::new(r"(?i)(\w+)\s+IN\s*\((.+)\)")?;
+                if let Some(caps) = in_re.captures(cond_str) {
+                    let column = caps.get(1).unwrap().as_str().to_string();
+                    let values_str = caps.get(2).unwrap().as_str();
+                    let first_value = values_str.split(',').next().unwrap().trim();
+                    let value = Self::parse_value(first_value)?;
+                    
+                    conditions.push(Condition {
+                        column,
+                        operator: ComparisonOperator::In,
+                        value,
+                    });
+                    matched = true;
+                }
+            }
+            
+            if !matched {
+                return Err(CoreDBError::QueryParsingError {
+                    message: format!("Invalid WHERE condition: {}", cond_str),
+                });
+            }
         }
+        
+        if conditions.is_empty() {
+            return Err(CoreDBError::QueryParsingError {
+                message: "Empty WHERE clause".to_string(),
+            });
+        }
+        
+        Ok(WhereClause { conditions })
     }
+
     
     fn parse_data_type(type_str: &str) -> Result<CassandraDataType> {
         match type_str.to_uppercase().as_str() {
