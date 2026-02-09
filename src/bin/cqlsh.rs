@@ -1,7 +1,7 @@
 use coredb::database::{CoreDB, DatabaseConfig};
 use coredb::query::QueryResult;
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, Result as RustylineResult};
+use rustyline::DefaultEditor;
 use prettytable::{Table, Row as PrettyRow, Cell};
 use colored::*;
 use std::path::PathBuf;
@@ -111,7 +111,7 @@ impl CqlShell {
     }
 
     async fn describe_keyspaces(&self) -> anyhow::Result<String> {
-        let stats = self.db.get_stats().await;
+        let _stats = self.db.get_stats().await;
         let keyspaces = self.db.keyspaces.read().await;
         
         let mut table = Table::new();

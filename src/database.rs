@@ -163,7 +163,7 @@ impl CoreDB {
                     let memtable = Memtable::new(schema_arc.clone());
                     
                     // SSTable 데이터를 Memtable에 로드 (재시작 시 데이터 복구)
-                    let mut loaded_count = 0;
+                    let mut _loaded_count = 0;
                     for sstable in &sstables {
                         
                         for pk in sstable.partition_index.keys() {
@@ -172,7 +172,7 @@ impl CoreDB {
                                     
                                     for entry in partition.rows.iter() {
                                         let _ = memtable.put(entry.value().clone());
-                                        loaded_count += 1;
+                                        _loaded_count += 1;
                                     }
                                 }
                                 Ok(None) => eprintln!("[load] Partition not found"),

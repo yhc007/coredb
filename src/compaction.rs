@@ -68,7 +68,7 @@ impl CompactionManager {
     
     /// 컴팩션 작업 스케줄링
     pub async fn schedule_compaction(&self, keyspace: &str, table: &str) {
-        let table_key = format!("{}.{}", keyspace, table);
+        let _table_key = format!("{}.{}", keyspace, table);
         
         // TODO: 실제로는 SSTable 리스트를 받아서 컴팩션 전략에 따라 작업 생성
         let task = CompactionTask {

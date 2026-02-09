@@ -1,5 +1,5 @@
 use crate::schema::{TableSchema, PartitionKey, ClusteringKey, CassandraValue, Row as SchemaRow, Cell};
-use crate::storage::{Memtable, SSTable};
+use crate::storage::Memtable;
 use crate::query::{CqlStatement, QueryResult, Row as QueryRow};
 use crate::error::*;
 use std::sync::Arc;

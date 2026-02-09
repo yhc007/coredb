@@ -1,6 +1,4 @@
-use std::path::PathBuf;
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 /// 간단한 데이터베이스 구조
 #[derive(Debug)]

@@ -63,13 +63,13 @@ impl SSTable {
         );
         
         let mut partition_index = BTreeMap::new();
-        let mut current_offset = 0u64;
+        let mut current_offset: u64;
         let mut min_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
         let mut total_size = 0u64;
         
         // 헤더 공간 예약 (나중에 업데이트)
-        let header_size = bincode::serialized_size(&SSTableHeader {
+        let _header_size = bincode::serialized_size(&SSTableHeader {
             version: 1,
             compression: CompressionType::None,
             min_timestamp: 0,
@@ -363,7 +363,7 @@ impl SSTable {
         cursor.read_exact(&mut size_buf).await?;
         let row_count = u32::from_le_bytes(size_buf) as usize;
         
-        let mut rows = crossbeam_skiplist::SkipMap::new();
+        let rows = crossbeam_skiplist::SkipMap::new();
         
         for _ in 0..row_count {
             cursor.read_exact(&mut size_buf).await?;

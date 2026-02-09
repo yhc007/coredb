@@ -159,7 +159,7 @@ impl CqlParser {
             // 컬럼 파싱 (매우 간단한 버전)
             let mut columns = Vec::new();
             let mut partition_key = Vec::new();
-            let mut clustering_key = Vec::new();
+            let clustering_key = Vec::new();
             
             for column_def in columns_str.split(',') {
                 let parts: Vec<&str> = column_def.trim().split_whitespace().collect();
@@ -321,14 +321,14 @@ impl CqlParser {
         }
     }
     
-    fn parse_update(query: &str) -> Result<CqlStatement> {
+    fn parse_update(_query: &str) -> Result<CqlStatement> {
         // 간단한 UPDATE 파싱
         Err(CoreDBError::QueryParsingError {
             message: "UPDATE not implemented yet".to_string(),
         })
     }
     
-    fn parse_delete(query: &str) -> Result<CqlStatement> {
+    fn parse_delete(_query: &str) -> Result<CqlStatement> {
         // 간단한 DELETE 파싱
         Err(CoreDBError::QueryParsingError {
             message: "DELETE not implemented yet".to_string(),

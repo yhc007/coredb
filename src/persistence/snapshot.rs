@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::{Write, Read, BufReader, BufWriter};
+use std::io::{Write, Read, BufReader};
 use std::path::Path;
 use crate::error::*;
 

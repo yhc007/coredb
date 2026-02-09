@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncWriteExt, AsyncReadExt, BufWriter, SeekFrom};
+use tokio::io::{AsyncWriteExt, AsyncReadExt, BufWriter};
 use serde::{Serialize, Deserialize};
 use crate::schema::{PartitionKey, ClusteringKey, Row};
 use crate::error::*;
