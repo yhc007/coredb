@@ -1,5 +1,5 @@
 cargo:rerun-if-env-changed=ZSTD_SYS_USE_PKG_CONFIG
-OUT_DIR = Some(/Volumes/Paul/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
+OUT_DIR = Some(/Volumes/T7/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
 OPT_LEVEL = Some(0)
 TARGET = Some(aarch64-apple-darwin)
 HOST = Some(aarch64-apple-darwin)
@@ -27,7 +27,7 @@ CFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
 CFLAGS_aarch64-apple-darwin = None
 CARGO_ENCODED_RUSTFLAGS = Some()
-OUT_DIR = Some(/Volumes/Paul/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
+OUT_DIR = Some(/Volumes/T7/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
 cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
 cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
 CRATE_CC_NO_DEFAULTS = None
@@ -43,7 +43,7 @@ cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
 CFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
 CFLAGS_aarch64-apple-darwin = None
-OUT_DIR = Some(/Volumes/Paul/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
+OUT_DIR = Some(/Volumes/T7/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
 cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
 cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
 CRATE_CC_NO_DEFAULTS = None
@@ -59,7 +59,7 @@ cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
 CFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
 CFLAGS_aarch64-apple-darwin = None
-OUT_DIR = Some(/Volumes/Paul/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
+OUT_DIR = Some(/Volumes/T7/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out)
 cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
 cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
 CRATE_CC_NO_DEFAULTS = None
@@ -129,6 +129,6 @@ ARFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=ARFLAGS_aarch64-apple-darwin
 ARFLAGS_aarch64-apple-darwin = None
 cargo:rustc-link-lib=static=zstd
-cargo:rustc-link-search=native=/Volumes/Paul/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out
-cargo:root=/Volumes/Paul/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out
+cargo:rustc-link-search=native=/Volumes/T7/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out
+cargo:root=/Volumes/T7/Work/coredb/target/debug/build/zstd-sys-c3768d259ae3df4a/out
 cargo:include=/Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zstd-sys-2.0.16+zstd.1.5.7/zstd/lib

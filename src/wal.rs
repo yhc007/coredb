@@ -255,7 +255,7 @@ mod tests {
         commit_log.segment_size_limit = 1024; // 1KB
         
         // 여러 엔트리 추가하여 세그먼트 로테이션 트리거
-        for i in 0..10 {
+        for _i in 0..10 {
             let entry = CommitLogEntry {
                 keyspace: "test_keyspace".to_string(),
                 table: "test_table".to_string(),

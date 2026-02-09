@@ -623,8 +623,8 @@ pub struct DatabaseStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ColumnDefinition, CassandraDataType, TableSchema, PartitionKey, CassandraValue};
-    use std::collections::HashMap;
+    use crate::schema::{ColumnDefinition, CassandraDataType, TableSchema};
+    
     
     #[tokio::test]
     async fn test_coredb_creation() {
@@ -681,16 +681,19 @@ mod tests {
         let config = DatabaseConfig::default();
         let db = CoreDB::new(config).await.unwrap();
         
-        let result = db.execute_cql("CREATE KEYSPACE test_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1}").await.unwrap();
+        // Use unique keyspace name to avoid conflicts with parallel tests
+        let ks_name = format!("test_ks_{}", std::process::id());
+        
+        let result = db.execute_cql(&format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}", ks_name)).await.unwrap();
         assert!(result.is_success());
         
-        let result = db.execute_cql("CREATE TABLE test_ks.test_table (id INT PRIMARY KEY, name TEXT)").await.unwrap();
+        let result = db.execute_cql(&format!("CREATE TABLE {}.test_table (id INT PRIMARY KEY, name TEXT)", ks_name)).await.unwrap();
         assert!(result.is_success());
         
-        let result = db.execute_cql("INSERT INTO test_ks.test_table (id, name) VALUES (1, 'John')").await.unwrap();
+        let result = db.execute_cql(&format!("INSERT INTO {}.test_table (id, name) VALUES (1, 'John')", ks_name)).await.unwrap();
         assert!(result.is_success());
         
-        let result = db.execute_cql("SELECT * FROM test_ks.test_table WHERE id = 1").await.unwrap();
+        let result = db.execute_cql(&format!("SELECT * FROM {}.test_table WHERE id = 1", ks_name)).await.unwrap();
         assert!(result.is_success());
     }
 }

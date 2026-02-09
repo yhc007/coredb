@@ -229,7 +229,7 @@ mod tests {
     
     #[test]
     fn test_level_manager_thresholds() {
-        let mut manager = LevelManager::new(5, 10.0);
+        let manager = LevelManager::new(5, 10.0);
         
         assert_eq!(manager.get_threshold_for_level(0), 4);
         assert_eq!(manager.get_threshold_for_level(1), 100);
@@ -238,7 +238,7 @@ mod tests {
     
     #[test]
     fn test_level_manager_compaction_trigger() {
-        let mut manager = LevelManager::new(3, 10.0);
+        let manager = LevelManager::new(3, 10.0);
         
         // 아직 컴팩션이 필요하지 않음
         assert!(manager.needs_compaction().is_none());
