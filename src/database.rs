@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use crate::schema::{TableSchema, KeyspaceDefinition, ReplicationStrategy};
-use crate::storage::{Memtable, SSTable};
+use crate::storage::{Memtable, SSTable, BlockCache, CacheConfig, CacheKey};
 use crate::wal::{CommitLog, Mutation};
 use crate::query::{QueryEngine, CqlStatement, QueryResult};
 use crate::compaction::{CompactionManager, CompactionConfig};
@@ -18,6 +18,10 @@ pub struct DatabaseConfig {
     pub compaction_throughput_mb_per_sec: u64,
     pub concurrent_reads: usize,
     pub concurrent_writes: usize,
+    /// Block Cache 최대 크기 (MB)
+    pub block_cache_size_mb: usize,
+    /// Block Cache 최대 엔트리 수
+    pub block_cache_max_entries: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -29,6 +33,8 @@ impl Default for DatabaseConfig {
             compaction_throughput_mb_per_sec: 16,
             concurrent_reads: 32,
             concurrent_writes: 32,
+            block_cache_size_mb: 128, // 128MB 기본값
+            block_cache_max_entries: 10_000,
         }
     }
 }
@@ -57,6 +63,8 @@ pub struct CoreDB {
     pub query_engine: Arc<RwLock<QueryEngine>>,
     pub config: DatabaseConfig,
     pub compaction_manager: Arc<CompactionManager>,
+    /// Block Cache (읽기 성능 최적화)
+    pub block_cache: Arc<BlockCache>,
 }
 
 impl CoreDB {
@@ -83,12 +91,21 @@ impl CoreDB {
         
         let compaction_manager = CompactionManager::new(compaction_config);
         
+        // Block Cache 초기화
+        let cache_config = CacheConfig {
+            max_size_bytes: config.block_cache_size_mb * 1024 * 1024,
+            max_entries: config.block_cache_max_entries,
+            num_shards: 16,
+        };
+        let block_cache = Arc::new(BlockCache::new(cache_config));
+        
         let mut db = Self {
             keyspaces,
             commit_log: Arc::new(RwLock::new(commit_log)),
             query_engine: Arc::new(RwLock::new(query_engine)),
             config,
             compaction_manager: Arc::new(compaction_manager),
+            block_cache,
         };
         
         // 시스템 키스페이스 초기화

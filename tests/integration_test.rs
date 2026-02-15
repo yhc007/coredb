@@ -12,6 +12,7 @@ async fn test_database_lifecycle() {
         compaction_throughput_mb_per_sec: 16,
         concurrent_reads: 32,
         concurrent_writes: 32,
+        ..Default::default()
     };
     
     // 1. 데이터베이스 생성

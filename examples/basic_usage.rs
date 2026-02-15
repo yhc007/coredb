@@ -12,6 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compaction_throughput_mb_per_sec: 16,
         concurrent_reads: 32,
         concurrent_writes: 32,
+        ..Default::default()
     };
     
     // 데이터베이스 초기화

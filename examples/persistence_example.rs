@@ -17,6 +17,7 @@ async fn main() {
         compaction_throughput_mb_per_sec: 16,
         concurrent_reads: 32,
         concurrent_writes: 32,
+        ..Default::default()
     };
     
     println!("1️⃣  Creating database...");

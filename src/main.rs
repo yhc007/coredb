@@ -72,6 +72,8 @@ async fn main() {
         compaction_throughput_mb_per_sec: 16,
         concurrent_reads: 32,
         concurrent_writes: 32,
+        block_cache_size_mb: 128,      // 128MB Block Cache
+        block_cache_max_entries: 10_000,
     };
     
     match cli.command {
