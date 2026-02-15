@@ -4,15 +4,18 @@ Official YCSB-style benchmark data for CoreDB.
 
 ## 📋 Test Environment
 
-| Item | Spec |
-|------|------|
-| **Hardware** | Apple Mac Studio |
-| **CPU** | Apple Silicon (M1 Max/Ultra - T6000) |
-| **Architecture** | ARM64 |
-| **OS** | macOS 26.2 (Darwin 25.2.0) |
-| **CoreDB Version** | 0.1.0 |
-| **Test Date** | 2026-02-16 |
-| **Rust Version** | Latest stable |
+### [HW 환경]
+- **CPU**: Apple Silicon M1 Max (10-core)
+- **RAM**: 32GB Unified Memory
+- **Storage**: NVMe SSD (T7 External)
+- **Architecture**: ARM64
+
+### [SW 환경]
+- **Database**: CoreDB v0.1.0 (Rust, Tokio 1.0 런타임)
+- **Benchmark**: YCSB 벤치마크 프레임워크
+- **OS**: macOS 26.2 (Darwin 25.2.0)
+- **Compiler**: rustc (Latest stable)
+- **Test Date**: 2026-02-16
 
 ---
 
