@@ -17,6 +17,10 @@ path = "persistent_db.rs"
 name = "cqlsh"
 path = "src/bin/cqlsh.rs"
 
+[[bin]]
+name = "ycsb_benchmark"
+path = "ycsb_benchmark.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
