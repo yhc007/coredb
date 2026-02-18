@@ -89,15 +89,29 @@ impl BlobWriter {
         })
     }
     
-    /// Blob 데이터 쓰기
+    /// Blob 데이터 쓰기 (LZ4 압축 적용)
     pub async fn write_blob(&mut self, data: &[u8]) -> Result<BlobRef> {
-        let checksum = crc32fast::hash(data);
+        // 원본 데이터 체크섬 (압축 전)
+        let original_checksum = crc32fast::hash(data);
         
-        // 엔트리 헤더
+        // LZ4 압축 시도
+        let (write_data, compression) = if data.len() > 256 {
+            let compressed = lz4_flex::compress_prepend_size(data);
+            // 압축 효과가 있는 경우에만 사용 (10% 이상 줄어야 함)
+            if compressed.len() < data.len() * 9 / 10 {
+                (compressed, 1u8) // 1 = LZ4
+            } else {
+                (data.to_vec(), 0u8) // 0 = None
+            }
+        } else {
+            (data.to_vec(), 0u8)
+        };
+        
+        // 엔트리 헤더 (압축된 크기 저장)
         let entry_header = BlobEntryHeader {
-            size: data.len() as u64,
-            checksum,
-            compression: 0, // TODO: 압축 지원
+            size: write_data.len() as u64,
+            checksum: original_checksum, // 원본 체크섬 저장
+            compression,
         };
         
         let entry_header_data = bincode::serialize(&entry_header)?;
@@ -109,17 +123,17 @@ impl BlobWriter {
         self.file.write_all(&entry_header_data).await?;
         self.current_offset += entry_header_data.len() as u64;
         
-        // 데이터 쓰기
-        self.file.write_all(data).await?;
-        self.current_offset += data.len() as u64;
+        // 데이터 쓰기 (압축된 데이터)
+        self.file.write_all(&write_data).await?;
+        self.current_offset += write_data.len() as u64;
         
         self.blob_count += 1;
         
         Ok(BlobRef {
             file_id: self.file_id.clone(),
             offset: blob_offset,
-            size: data.len() as u64,
-            checksum,
+            size: data.len() as u64, // 원본 크기 반환
+            checksum: original_checksum,
         })
     }
     
@@ -171,7 +185,7 @@ impl BlobReader {
         }
     }
     
-    /// Blob 데이터 읽기
+    /// Blob 데이터 읽기 (압축 해제 지원)
     pub async fn read_blob(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
         let file = self.get_file(&blob_ref.file_id).await?;
         
@@ -186,11 +200,23 @@ impl BlobReader {
         
         let entry_header: BlobEntryHeader = bincode::deserialize(&header_buf)?;
         
-        // 데이터 읽기
-        let mut data = vec![0u8; entry_header.size as usize];
-        file_guard.read_exact(&mut data).await?;
+        // 압축된 데이터 읽기
+        let mut compressed_data = vec![0u8; entry_header.size as usize];
+        file_guard.read_exact(&mut compressed_data).await?;
         
-        // 체크섬 검증
+        // 압축 해제
+        let data = match entry_header.compression {
+            1 => {
+                // LZ4 압축 해제
+                lz4_flex::decompress_size_prepended(&compressed_data)
+                    .map_err(|e| CoreDBError::DataCorruption(
+                        format!("LZ4 decompression failed: {}", e)
+                    ))?
+            },
+            _ => compressed_data, // 압축 없음
+        };
+        
+        // 체크섬 검증 (원본 데이터 기준)
         let checksum = crc32fast::hash(&data);
         if checksum != blob_ref.checksum {
             return Err(CoreDBError::DataCorruption(

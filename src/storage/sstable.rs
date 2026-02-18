@@ -166,6 +166,11 @@ impl SSTable {
         let index_json = serde_json::to_string(&index_vec)?;
         tokio::fs::write(&index_file_path, index_json).await?;
         
+        // Bloom Filter를 별도 파일로 저장
+        let bloom_file_path = base_dir.join(format!("{}-Bloom.db", sstable_id));
+        let bloom_data = bincode::serialize(&bloom_filter)?;
+        tokio::fs::write(&bloom_file_path, bloom_data).await?;
+        
         Ok(SSTable {
             id: sstable_id,
             file_path: data_file_path,
@@ -175,6 +180,127 @@ impl SSTable {
             min_timestamp,
             max_timestamp,
             compression: compression.clone(),
+            size_bytes: total_size,
+        })
+    }
+    
+    /// 파티션 데이터로부터 SSTable 생성 (컴팩션용)
+    pub async fn create_from_partitions(
+        partitions: &std::collections::BTreeMap<PartitionKey, crate::storage::memtable::Partition>,
+        base_dir: &PathBuf,
+        compression: CompressionType,
+    ) -> Result<Self> {
+        if partitions.is_empty() {
+            return Err(CoreDBError::Generic { message: "Empty partitions".to_string() });
+        }
+        
+        let sstable_id = Uuid::new_v4().to_string();
+        let data_file_path = base_dir.join(format!("{}-Data.db", sstable_id));
+        
+        let mut data_file = File::create(&data_file_path).await?;
+        
+        let mut bloom_filter = BloomFilter::new(partitions.len() as u64, 0.01);
+        let mut partition_index = BTreeMap::new();
+        let mut min_timestamp = i64::MAX;
+        let mut max_timestamp = i64::MIN;
+        let mut total_size = 0u64;
+        
+        // 헤더 공간 예약
+        let dummy_header = SSTableHeader {
+            version: 1,
+            compression: CompressionType::None,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            partition_count: 0,
+            bloom_filter_offset: 0,
+            partition_index_offset: 0,
+            summary_index_offset: 0,
+        };
+        let dummy_header_data = bincode::serialize(&dummy_header)?;
+        data_file.write_all(&dummy_header_data).await?;
+        
+        let mut current_offset = dummy_header_data.len() as u64;
+        
+        // 파티션별로 SSTable에 쓰기
+        for (partition_key, partition) in partitions {
+            // 블룸 필터에 파티션 키 추가
+            bloom_filter.add(partition_key);
+            
+            // 파티션 인덱스 업데이트
+            partition_index.insert(partition_key.clone(), current_offset);
+            
+            // 파티션 데이터 직렬화 및 압축
+            let partition_data = Self::serialize_partition(partition, &compression).await?;
+            
+            // 데이터 파일에 쓰기
+            data_file.write_u32_le(partition_data.len() as u32).await?;
+            data_file.write_all(&partition_data).await?;
+            
+            let partition_size = 4 + partition_data.len() as u64;
+            current_offset += partition_size;
+            total_size += partition_size;
+            
+            // 타임스탬프 범위 업데이트
+            for row_entry in partition.rows.iter() {
+                let row = row_entry.value();
+                min_timestamp = min_timestamp.min(row.timestamp);
+                max_timestamp = max_timestamp.max(row.timestamp);
+            }
+        }
+        
+        let bloom_filter_offset = current_offset;
+        let bloom_filter_data = bincode::serialize(&bloom_filter)?;
+        data_file.write_all(&bloom_filter_data).await?;
+        current_offset += bloom_filter_data.len() as u64;
+        
+        let partition_index_offset = current_offset;
+        let partition_index_data = bincode::serialize(&partition_index)?;
+        data_file.write_all(&partition_index_data).await?;
+        current_offset += partition_index_data.len() as u64;
+        
+        let summary_index_offset = current_offset;
+        let summary_index = Self::build_summary_index(&partition_index);
+        let summary_index_data = bincode::serialize(&summary_index)?;
+        data_file.write_all(&summary_index_data).await?;
+        
+        // 헤더 업데이트
+        let header = SSTableHeader {
+            version: 1,
+            compression,
+            min_timestamp,
+            max_timestamp,
+            partition_count: partition_index.len() as u64,
+            bloom_filter_offset,
+            partition_index_offset,
+            summary_index_offset,
+        };
+        
+        let header_data = bincode::serialize(&header)?;
+        data_file.seek(SeekFrom::Start(0)).await?;
+        data_file.write_all(&header_data).await?;
+        data_file.sync_all().await?;
+        
+        // 인덱스 파일 저장
+        let index_file_path = base_dir.join(format!("{}-Index.json", sstable_id));
+        let index_vec: Vec<(PartitionKey, u64)> = partition_index.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let index_json = serde_json::to_string(&index_vec)?;
+        tokio::fs::write(&index_file_path, index_json).await?;
+        
+        // Bloom Filter 별도 파일 저장
+        let bloom_file_path = base_dir.join(format!("{}-Bloom.db", sstable_id));
+        tokio::fs::write(&bloom_file_path, &bloom_filter_data).await?;
+        
+        Ok(SSTable {
+            id: sstable_id,
+            file_path: data_file_path,
+            bloom_filter,
+            partition_index,
+            summary_index,
+            min_timestamp,
+            max_timestamp,
+            compression,
             size_bytes: total_size,
         })
     }
@@ -196,9 +322,27 @@ impl SSTable {
         let header: SSTableHeader = bincode::deserialize(&header_data)
             .map_err(|e| CoreDBError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
         
-        // Bloom filter 읽기
-        file.seek(SeekFrom::Start(header.bloom_filter_offset)).await?;
-        let bloom_filter = BloomFilter::new(1000, 0.01); // 기본값으로 생성 (실제로는 역직렬화 필요)
+        // Bloom filter 읽기 (별도 파일 우선)
+        let bloom_file_path = file_path.with_file_name(
+            file_path.file_stem().unwrap().to_string_lossy().replace("-Data", "-Bloom") + ".db"
+        );
+        
+        let bloom_filter = if bloom_file_path.exists() {
+            // 별도 파일에서 로드
+            let bloom_data = tokio::fs::read(&bloom_file_path).await?;
+            bincode::deserialize(&bloom_data).unwrap_or_else(|_| BloomFilter::new(1000, 0.01))
+        } else {
+            // 레거시: Data.db에서 로드 시도
+            file.seek(SeekFrom::Start(header.bloom_filter_offset)).await?;
+            let bloom_size = if header.partition_index_offset > header.bloom_filter_offset {
+                (header.partition_index_offset - header.bloom_filter_offset) as usize
+            } else {
+                4096
+            };
+            let mut bloom_buf = vec![0u8; bloom_size];
+            file.read_exact(&mut bloom_buf).await.ok();
+            bincode::deserialize(&bloom_buf).unwrap_or_else(|_| BloomFilter::new(1000, 0.01))
+        };
         
         // Partition index 읽기 (JSON 파일 우선)
         let index_file_path = file_path.with_file_name(
@@ -256,11 +400,10 @@ impl SSTable {
     
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
-        // 1. 블룸 필터 체크 (스킵 - open()에서 로드 안 됨)
-        // TODO: bloom_filter도 별도 파일로 저장/로드
-        // if !self.bloom_filter.might_contain(partition_key) {
-        //     return Ok(None);
-        // }
+        // 1. 블룸 필터 체크 (빠른 음성 응답)
+        if !self.bloom_filter.might_contain(partition_key) {
+            return Ok(None);
+        }
         
         // 2. 파티션 인덱스에서 오프셋 찾기
         let offset = match self.partition_index.get(partition_key) {

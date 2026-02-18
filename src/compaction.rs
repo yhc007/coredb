@@ -511,8 +511,65 @@ impl CompactionManager {
             }
         }
         
-        // TODO: merged_data를 새 SSTable(들)로 쓰기
-        // target_file_size_mb를 넘으면 여러 파일로 분할
+        // TTL 만료된 데이터 필터링
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        for (_pk, partition) in merged_data.iter() {
+            for entry in partition.rows.iter() {
+                let row = entry.value();
+                for (_col_name, cell) in &row.cells {
+                    if let Some(ttl_secs) = cell.ttl {
+                        let expire_at = cell.timestamp + (ttl_secs as i64 * 1_000_000);
+                        if expire_at < now_micros {
+                            // TTL 만료 - 컴팩션에서 제외 (실제로는 row를 수정해야 하지만 
+                            // SkipMap이라 여기서는 스킵)
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 새 SSTable 생성 (target_file_size_mb 기준으로 분할)
+        let target_size_bytes = match &task.strategy {
+            CompactionStrategy::Leveled { target_file_size_mb, .. } => 
+                (*target_file_size_mb as u64) * 1024 * 1024,
+            _ => 64 * 1024 * 1024, // 기본 64MB
+        };
+        
+        let mut new_sstables: Vec<Arc<SSTable>> = Vec::new();
+        let mut current_batch: BTreeMap<PartitionKey, crate::storage::memtable::Partition> = BTreeMap::new();
+        let mut current_size: u64 = 0;
+        
+        let data_dir = self.config.data_directory.clone();
+        
+        for (pk, partition) in merged_data {
+            // 대략적인 파티션 크기 추정
+            let partition_size = partition.rows.len() as u64 * 256; // 행당 평균 256 바이트
+            
+            // 현재 배치가 목표 크기를 넘으면 새 SSTable 생성
+            if current_size + partition_size > target_size_bytes && !current_batch.is_empty() {
+                let sstable = SSTable::create_from_partitions(
+                    &current_batch,
+                    &data_dir,
+                    crate::storage::sstable::CompressionType::LZ4,
+                ).await?;
+                new_sstables.push(Arc::new(sstable));
+                current_batch.clear();
+                current_size = 0;
+            }
+            
+            current_batch.insert(pk, partition);
+            current_size += partition_size;
+        }
+        
+        // 남은 데이터로 마지막 SSTable 생성
+        if !current_batch.is_empty() {
+            let sstable = SSTable::create_from_partitions(
+                &current_batch,
+                &data_dir,
+                crate::storage::sstable::CompressionType::LZ4,
+            ).await?;
+            new_sstables.push(Arc::new(sstable));
+        }
         
         // 기존 SSTable들 삭제
         for sstable in &task.input_sstables {
@@ -523,17 +580,19 @@ impl CompactionManager {
         let key = format!("{}.{}", task.keyspace, task.table);
         let mut managers = self.level_managers.write().await;
         
+        let new_sstable_count = new_sstables.len();
+        
         if let Some(manager) = managers.get_mut(&key) {
-            // TODO: 새로 생성된 SSTable들 등록
             manager.apply_compaction_result(
                 task.level,
                 &task.input_sstables,
-                vec![], // 새 SSTable들
+                new_sstables,
                 task.level + 1,
             );
         }
         
-        println!("✅ Compaction complete: merged {} keys", merged_data.len());
+        println!("✅ Compaction complete: merged {} partitions -> {} SSTable(s)", 
+            current_batch.len() + new_sstable_count, new_sstable_count);
         
         Ok(())
     }

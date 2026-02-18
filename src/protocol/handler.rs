@@ -85,9 +85,11 @@ impl RequestHandler {
     
     async fn handle_execute(&self, execute: ExecuteRequest) -> Response {
         // Prepared statement 실행
-        if let Some(query) = self.prepared_statements.get(&execute.id) {
-            // TODO: 바인드 변수 처리
-            match self.db.execute_cql(query).await {
+        if let Some(query_template) = self.prepared_statements.get(&execute.id) {
+            // 바인드 변수 처리
+            let bound_query = self.bind_values(query_template, &execute.values);
+            
+            match self.db.execute_cql(&bound_query).await {
                 Ok(result) => self.convert_result(result),
                 Err(e) => Response::Error(ErrorResponse::syntax_error(e.to_string())),
             }
@@ -97,6 +99,64 @@ impl RequestHandler {
                 "Prepared statement not found",
             ))
         }
+    }
+    
+    /// 바인드 변수를 쿼리에 적용
+    fn bind_values(&self, query: &str, values: &[Option<Bytes>]) -> String {
+        let mut result = query.to_string();
+        
+        for value in values {
+            if let Some(pos) = result.find('?') {
+                let replacement = match value {
+                    Some(bytes) => {
+                        // 바이트를 값으로 변환
+                        self.bytes_to_cql_literal(bytes)
+                    },
+                    None => "NULL".to_string(),
+                };
+                result.replace_range(pos..pos+1, &replacement);
+            }
+        }
+        
+        result
+    }
+    
+    /// 바이트를 CQL 리터럴로 변환
+    fn bytes_to_cql_literal(&self, bytes: &Bytes) -> String {
+        // Native Protocol에서 값은 타입에 따라 인코딩됨
+        // 간단한 구현: 문자열로 시도, 실패 시 정수로 시도
+        if bytes.is_empty() {
+            return "NULL".to_string();
+        }
+        
+        // 문자열로 시도
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            // 숫자인지 확인
+            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                return s.to_string();
+            }
+            // 문자열은 따옴표로 감싸기
+            return format!("'{}'", s.replace('\'', "''"));
+        }
+        
+        // 4바이트 정수
+        if bytes.len() == 4 {
+            let val = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            return val.to_string();
+        }
+        
+        // 8바이트 정수 (bigint)
+        if bytes.len() == 8 {
+            let val = i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7]
+            ]);
+            return val.to_string();
+        }
+        
+        // 기타: hex로 반환
+        let hex_str: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        format!("0x{}", hex_str)
     }
     
     async fn handle_batch(&self, batch: BatchRequest) -> Response {
