@@ -52,17 +52,20 @@ impl QueryEngine {
             CqlStatement::CreateTable { keyspace, name, columns, partition_key, clustering_key, options } => {
                 self.create_table(keyspace, name, columns, partition_key, clustering_key, options).await
             },
-            CqlStatement::Insert { keyspace, table, values, ttl } => {
-                self.insert_row(keyspace, table, values, ttl).await
+            CqlStatement::Insert { keyspace, table, values, ttl, if_not_exists } => {
+                self.insert_row(keyspace, table, values, ttl, if_not_exists).await
             },
-            CqlStatement::Select { keyspace, table, columns, where_clause, limit } => {
-                self.select_rows(keyspace, table, columns, where_clause, limit).await
+            CqlStatement::Select { keyspace, table, columns, where_clause, limit, aggregations } => {
+                self.select_rows(keyspace, table, columns, where_clause, limit, aggregations).await
             },
-            CqlStatement::Update { keyspace, table, values, where_clause } => {
-                self.update_row(keyspace, table, values, where_clause).await
+            CqlStatement::Update { keyspace, table, values, where_clause, if_conditions } => {
+                self.update_row(keyspace, table, values, where_clause, if_conditions).await
             },
             CqlStatement::Delete { keyspace, table, where_clause } => {
                 self.delete_row(keyspace, table, where_clause).await
+            },
+            CqlStatement::Batch { statements } => {
+                self.execute_batch(statements).await
             },
             CqlStatement::DropTable { keyspace, name } => {
                 self.drop_table(keyspace, name).await
@@ -161,7 +164,7 @@ impl QueryEngine {
         Ok(QueryResult::Success)
     }
     
-    async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, ttl: Option<u32>) -> Result<QueryResult> {
+    async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, ttl: Option<u32>, if_not_exists: bool) -> Result<QueryResult> {
         let keyspace_name = if keyspace.is_empty() {
             self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
                 message: "No keyspace selected".to_string(),
@@ -182,6 +185,17 @@ impl QueryEngine {
         
         // 파티션 키와 클러스터링 키 추출
         let (partition_key, clustering_key) = self.extract_keys_from_values(values.clone(), &table_struct.schema)?;
+        
+        // IF NOT EXISTS 체크
+        if if_not_exists {
+            let existing = table_struct.current_memtable.get(&partition_key, &clustering_key);
+            if existing.is_some() {
+                // 이미 존재하면 [applied] = false 반환
+                let mut result_row = HashMap::new();
+                result_row.insert("[applied]".to_string(), CassandraValue::Boolean(false));
+                return Ok(QueryResult::Rows(vec![QueryRow { columns: result_row }]));
+            }
+        }
         
         // 행 생성 - cells에는 regular columns만 포함
         let mut cells = HashMap::new();
@@ -227,10 +241,17 @@ impl QueryEngine {
         // 메모리 테이블에 추가
         table_struct.current_memtable.put(row)?;
         
+        // IF NOT EXISTS 성공 시 [applied] = true 반환
+        if if_not_exists {
+            let mut result_row = HashMap::new();
+            result_row.insert("[applied]".to_string(), CassandraValue::Boolean(true));
+            return Ok(QueryResult::Rows(vec![QueryRow { columns: result_row }]));
+        }
+        
         Ok(QueryResult::Success)
     }
     
-    async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>) -> Result<QueryResult> {
+    async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>, aggregations: Vec<crate::query::parser::Aggregation>) -> Result<QueryResult> {
         let keyspace_name = if keyspace.is_empty() {
             self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
                 message: "No keyspace selected".to_string(),
@@ -412,7 +433,8 @@ impl QueryEngine {
             
             // 요청된 컬럼만 필터링
             let mut final_cells = HashMap::new();
-            if columns.contains(&"*".to_string()) {
+            if columns.contains(&"*".to_string()) || !aggregations.is_empty() {
+                // aggregation이 있으면 모든 컬럼 필요
                 final_cells = cells;
             } else {
                 for col in &columns {
@@ -430,21 +452,244 @@ impl QueryEngine {
             query_rows.truncate(l as usize);
         }
         
+        // Aggregation 처리
+        if !aggregations.is_empty() {
+            return self.compute_aggregations(&query_rows, &aggregations);
+        }
+        
         Ok(QueryResult::Rows(query_rows))
     }
     
-    async fn update_row(&mut self, _keyspace: String, _table: String, _values: Vec<(String, CassandraValue)>, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
-        // UPDATE는 INSERT로 구현 (Cassandra 스타일)
-        Err(CoreDBError::QueryParsingError {
-            message: "UPDATE not implemented yet".to_string(),
-        })
+    /// Aggregation 계산
+    fn compute_aggregations(&self, rows: &[QueryRow], aggregations: &[crate::query::parser::Aggregation]) -> Result<QueryResult> {
+        use crate::query::parser::AggregationFunc;
+        
+        let mut result_cells = HashMap::new();
+        
+        for agg in aggregations {
+            let agg_name = match agg.func {
+                AggregationFunc::Count => format!("count({})", agg.column),
+                AggregationFunc::Sum => format!("sum({})", agg.column),
+                AggregationFunc::Avg => format!("avg({})", agg.column),
+                AggregationFunc::Min => format!("min({})", agg.column),
+                AggregationFunc::Max => format!("max({})", agg.column),
+            };
+            
+            let value = match agg.func {
+                AggregationFunc::Count => {
+                    if agg.column == "*" {
+                        CassandraValue::BigInt(rows.len() as i64)
+                    } else {
+                        let count = rows.iter()
+                            .filter(|r| r.columns.contains_key(&agg.column))
+                            .count();
+                        CassandraValue::BigInt(count as i64)
+                    }
+                },
+                AggregationFunc::Sum => {
+                    let sum: i64 = rows.iter()
+                        .filter_map(|r| r.columns.get(&agg.column))
+                        .filter_map(|v| match v {
+                            CassandraValue::Int(i) => Some(*i as i64),
+                            CassandraValue::BigInt(i) => Some(*i),
+                            CassandraValue::Double(d) => Some(*d as i64),
+                            _ => None,
+                        })
+                        .sum();
+                    CassandraValue::BigInt(sum)
+                },
+                AggregationFunc::Avg => {
+                    let values: Vec<f64> = rows.iter()
+                        .filter_map(|r| r.columns.get(&agg.column))
+                        .filter_map(|v| match v {
+                            CassandraValue::Int(i) => Some(*i as f64),
+                            CassandraValue::BigInt(i) => Some(*i as f64),
+                            CassandraValue::Double(d) => Some(*d),
+                            _ => None,
+                        })
+                        .collect();
+                    
+                    if values.is_empty() {
+                        CassandraValue::Null
+                    } else {
+                        let avg = values.iter().sum::<f64>() / values.len() as f64;
+                        CassandraValue::Double(avg)
+                    }
+                },
+                AggregationFunc::Min => {
+                    let min = rows.iter()
+                        .filter_map(|r| r.columns.get(&agg.column))
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .cloned();
+                    min.unwrap_or(CassandraValue::Null)
+                },
+                AggregationFunc::Max => {
+                    let max = rows.iter()
+                        .filter_map(|r| r.columns.get(&agg.column))
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .cloned();
+                    max.unwrap_or(CassandraValue::Null)
+                },
+            };
+            
+            result_cells.insert(agg_name, value);
+        }
+        
+        Ok(QueryResult::Rows(vec![QueryRow { columns: result_cells }]))
     }
     
-    async fn delete_row(&mut self, _keyspace: String, _table: String, _where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
-        // DELETE 구현
-        Err(CoreDBError::QueryParsingError {
-            message: "DELETE not implemented yet".to_string(),
-        })
+    async fn update_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, where_clause: crate::query::parser::WhereClause, if_conditions: Option<Vec<crate::query::parser::Condition>>) -> Result<QueryResult> {
+        let keyspace_name = if keyspace.is_empty() {
+            self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
+                message: "No keyspace selected".to_string(),
+            })?
+        } else {
+            keyspace
+        };
+        
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces.get(&keyspace_name).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Keyspace '{}' does not exist", keyspace_name),
+        })?;
+        
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct = tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Table '{}' does not exist", table),
+        })?;
+        
+        // WHERE 절에서 파티션 키 추출
+        let partition_key = self.extract_partition_key(&table_struct.schema, &where_clause)?
+            .ok_or(CoreDBError::QueryExecutionError {
+                message: "UPDATE requires partition key in WHERE clause".to_string(),
+            })?;
+        
+        // 기존 행 조회
+        let existing_row = table_struct.current_memtable.get(&partition_key, &None);
+        
+        // IF 조건 체크
+        if let Some(conditions) = &if_conditions {
+            if let Some(ref row) = existing_row {
+                for cond in conditions {
+                    let cell_value = row.cells.get(&cond.column).map(|c| &c.value);
+                    let matches = match cell_value {
+                        Some(v) => Self::matches_condition(v, cond),
+                        None => false,
+                    };
+                    
+                    if !matches {
+                        let mut result_row = HashMap::new();
+                        result_row.insert("[applied]".to_string(), CassandraValue::Boolean(false));
+                        return Ok(QueryResult::Rows(vec![QueryRow { columns: result_row }]));
+                    }
+                }
+            } else {
+                // 행이 없으면 IF 조건 실패
+                let mut result_row = HashMap::new();
+                result_row.insert("[applied]".to_string(), CassandraValue::Boolean(false));
+                return Ok(QueryResult::Rows(vec![QueryRow { columns: result_row }]));
+            }
+        }
+        
+        // 기존 행이 없으면 새로 생성
+        let mut cells = if let Some(row) = existing_row {
+            row.cells.clone()
+        } else {
+            HashMap::new()
+        };
+        
+        let now = chrono::Utc::now().timestamp_micros();
+        
+        // 새 값으로 업데이트
+        for (col_name, value) in values {
+            cells.insert(col_name, Cell {
+                value,
+                timestamp: now,
+                ttl: None,
+                is_deleted: false,
+            });
+        }
+        
+        let new_row = SchemaRow {
+            partition_key,
+            clustering_key: None,
+            cells,
+            timestamp: now,
+        };
+        
+        table_struct.current_memtable.put(new_row)?;
+        
+        // IF 조건이 있었으면 [applied] = true 반환
+        if if_conditions.is_some() {
+            let mut result_row = HashMap::new();
+            result_row.insert("[applied]".to_string(), CassandraValue::Boolean(true));
+            return Ok(QueryResult::Rows(vec![QueryRow { columns: result_row }]));
+        }
+        
+        Ok(QueryResult::Success)
+    }
+    
+    async fn delete_row(&mut self, keyspace: String, table: String, where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
+        let keyspace_name = if keyspace.is_empty() {
+            self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
+                message: "No keyspace selected".to_string(),
+            })?
+        } else {
+            keyspace
+        };
+        
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces.get(&keyspace_name).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Keyspace '{}' does not exist", keyspace_name),
+        })?;
+        
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct = tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+            message: format!("Table '{}' does not exist", table),
+        })?;
+        
+        // WHERE 절에서 파티션 키 추출
+        let partition_key = self.extract_partition_key(&table_struct.schema, &where_clause)?
+            .ok_or(CoreDBError::QueryExecutionError {
+                message: "DELETE requires partition key in WHERE clause".to_string(),
+            })?;
+        
+        // 삭제 마커로 표시 (tombstone)
+        let now = chrono::Utc::now().timestamp_micros();
+        let tombstone_row = SchemaRow {
+            partition_key,
+            clustering_key: None,
+            cells: HashMap::new(), // 빈 셀 = 삭제됨
+            timestamp: now,
+        };
+        
+        table_struct.current_memtable.put(tombstone_row)?;
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// BATCH 실행
+    async fn execute_batch(&mut self, statements: Vec<CqlStatement>) -> Result<QueryResult> {
+        // 모든 문장을 순서대로 실행 (INSERT, UPDATE, DELETE만 허용)
+        for stmt in statements {
+            match stmt {
+                CqlStatement::Insert { keyspace, table, values, ttl, if_not_exists } => {
+                    self.insert_row(keyspace, table, values, ttl, if_not_exists).await?;
+                },
+                CqlStatement::Update { keyspace, table, values, where_clause, if_conditions } => {
+                    self.update_row(keyspace, table, values, where_clause, if_conditions).await?;
+                },
+                CqlStatement::Delete { keyspace, table, where_clause } => {
+                    self.delete_row(keyspace, table, where_clause).await?;
+                },
+                _ => {
+                    return Err(CoreDBError::QueryExecutionError {
+                        message: "BATCH only supports INSERT, UPDATE, DELETE".to_string(),
+                    });
+                }
+            }
+        }
+        
+        Ok(QueryResult::Success)
     }
     
     async fn drop_table(&mut self, keyspace: String, name: String) -> Result<QueryResult> {
@@ -722,6 +967,7 @@ mod tests {
                 ("name".to_string(), CassandraValue::Text("John".to_string())),
             ],
             ttl: None,
+            if_not_exists: false,
         };
         
         let result = engine.execute(insert).await.unwrap();
@@ -740,6 +986,7 @@ mod tests {
                 }],
             }),
             limit: None,
+            aggregations: vec![],
         };
         
         let result = engine.execute(select).await.unwrap();

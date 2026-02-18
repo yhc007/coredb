@@ -248,7 +248,7 @@ impl CoreDB {
         };
         
         // INSERT 시 인덱스 업데이트 정보 추출
-        let insert_info = if let CqlStatement::Insert { ref keyspace, ref table, ref values, ref ttl } = parsed {
+        let insert_info = if let CqlStatement::Insert { ref keyspace, ref table, ref values, ref ttl, .. } = parsed {
             Some((keyspace.clone(), table.clone(), values.clone(), *ttl))
         } else {
             None

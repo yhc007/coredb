@@ -21,6 +21,7 @@ pub enum CqlStatement {
         table: String,
         values: Vec<(String, CassandraValue)>,
         ttl: Option<u32>,
+        if_not_exists: bool,
     },
     Select {
         keyspace: String,
@@ -28,12 +29,14 @@ pub enum CqlStatement {
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
         limit: Option<u32>,
+        aggregations: Vec<Aggregation>,
     },
     Update {
         keyspace: String,
         table: String,
         values: Vec<(String, CassandraValue)>,
         where_clause: WhereClause,
+        if_conditions: Option<Vec<Condition>>,
     },
     Delete {
         keyspace: String,
@@ -59,6 +62,10 @@ pub enum CqlStatement {
     DropIndex {
         keyspace: String,
         name: String,
+    },
+    /// BATCH 작업
+    Batch {
+        statements: Vec<CqlStatement>,
     },
 }
 
@@ -104,6 +111,23 @@ pub enum ComparisonOperator {
     Like,
 }
 
+/// Aggregation 함수
+#[derive(Debug, Clone)]
+pub enum AggregationFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// Aggregation 정의
+#[derive(Debug, Clone)]
+pub struct Aggregation {
+    pub func: AggregationFunc,
+    pub column: String, // "*" for COUNT(*)
+}
+
 /// 간단한 CQL 파서 (실제 구현에서는 더 정교한 파서가 필요)
 pub struct CqlParser;
 
@@ -133,6 +157,8 @@ impl CqlParser {
             Self::parse_create_index(query)
         } else if query.to_uppercase().starts_with("DROP INDEX") {
             Self::parse_drop_index(query)
+        } else if query.to_uppercase().starts_with("BEGIN BATCH") {
+            Self::parse_batch(query)
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported query type: {}", query),
@@ -217,8 +243,11 @@ impl CqlParser {
     }
     
     fn parse_insert(query: &str) -> Result<CqlStatement> {
-        // INSERT 파싱 (USING TTL 지원)
-        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+?)\)(?:\s+USING\s+TTL\s+(\d+))?\s*;?\s*$")?;
+        // INSERT 파싱 (USING TTL + IF NOT EXISTS 지원)
+        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+?)\)(?:\s+USING\s+TTL\s+(\d+))?(?:\s+IF\s+NOT\s+EXISTS)?\s*;?\s*$")?;
+        
+        // IF NOT EXISTS 체크
+        let if_not_exists = query.to_uppercase().contains("IF NOT EXISTS");
         
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
@@ -247,6 +276,7 @@ impl CqlParser {
                 table,
                 values: value_pairs,
                 ttl,
+                if_not_exists,
             })
         } else {
             Err(CoreDBError::QueryParsingError {
@@ -304,11 +334,34 @@ impl CqlParser {
             let keyspace = caps.get(2).unwrap().as_str().to_string();
             let table = caps.get(3).unwrap().as_str().to_string();
             
-            let columns = if columns_str == "*" {
-                vec!["*".to_string()]
-            } else {
-                columns_str.split(',').map(|s| s.trim().to_string()).collect()
-            };
+            // Aggregation 파싱
+            let mut aggregations = Vec::new();
+            let mut columns = Vec::new();
+            
+            let agg_re = regex::Regex::new(r"(?i)(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(\*|\w+)\s*\)")?;
+            
+            for part in columns_str.split(',') {
+                let part = part.trim();
+                if let Some(agg_caps) = agg_re.captures(part) {
+                    let func_name = agg_caps.get(1).unwrap().as_str().to_uppercase();
+                    let col = agg_caps.get(2).unwrap().as_str().to_string();
+                    
+                    let func = match func_name.as_str() {
+                        "COUNT" => AggregationFunc::Count,
+                        "SUM" => AggregationFunc::Sum,
+                        "AVG" => AggregationFunc::Avg,
+                        "MIN" => AggregationFunc::Min,
+                        "MAX" => AggregationFunc::Max,
+                        _ => continue,
+                    };
+                    
+                    aggregations.push(Aggregation { func, column: col });
+                } else if part == "*" {
+                    columns.push("*".to_string());
+                } else {
+                    columns.push(part.to_string());
+                }
+            }
             
             // WHERE 절 파싱 (간단한 버전)
             let where_clause = if query.to_uppercase().contains("WHERE") {
@@ -330,6 +383,7 @@ impl CqlParser {
                 columns,
                 where_clause,
                 limit,
+                aggregations,
             })
         } else {
             Err(CoreDBError::QueryParsingError {
@@ -338,18 +392,164 @@ impl CqlParser {
         }
     }
     
-    fn parse_update(_query: &str) -> Result<CqlStatement> {
-        // 간단한 UPDATE 파싱
-        Err(CoreDBError::QueryParsingError {
-            message: "UPDATE not implemented yet".to_string(),
-        })
+    fn parse_update(query: &str) -> Result<CqlStatement> {
+        // UPDATE keyspace.table SET col1 = val1, col2 = val2 WHERE pk = x [IF condition]
+        let re = regex::Regex::new(r"(?i)UPDATE\s+(\w+)\.(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+?)(?:\s+IF\s+(.+?))?\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let keyspace = caps.get(1).unwrap().as_str().to_string();
+            let table = caps.get(2).unwrap().as_str().to_string();
+            let set_str = caps.get(3).unwrap().as_str();
+            let where_str = caps.get(4).unwrap().as_str();
+            let if_str = caps.get(5).map(|m| m.as_str());
+            
+            // SET 파싱
+            let mut values = Vec::new();
+            for set_part in set_str.split(',') {
+                let parts: Vec<&str> = set_part.split('=').collect();
+                if parts.len() == 2 {
+                    let col = parts[0].trim().to_string();
+                    let val = Self::parse_value(parts[1].trim())?;
+                    values.push((col, val));
+                }
+            }
+            
+            // WHERE 파싱
+            let where_clause = Self::parse_where_from_str(where_str)?;
+            
+            // IF 조건 파싱
+            let if_conditions = if let Some(if_part) = if_str {
+                Some(Self::parse_conditions_from_str(if_part)?)
+            } else {
+                None
+            };
+            
+            Ok(CqlStatement::Update {
+                keyspace,
+                table,
+                values,
+                where_clause,
+                if_conditions,
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid UPDATE syntax. Expected: UPDATE ks.table SET col=val WHERE pk=x [IF cond]".to_string(),
+            })
+        }
     }
     
-    fn parse_delete(_query: &str) -> Result<CqlStatement> {
-        // 간단한 DELETE 파싱
-        Err(CoreDBError::QueryParsingError {
-            message: "DELETE not implemented yet".to_string(),
-        })
+    fn parse_delete(query: &str) -> Result<CqlStatement> {
+        // DELETE FROM keyspace.table WHERE pk = x
+        let re = regex::Regex::new(r"(?i)DELETE\s+FROM\s+(\w+)\.(\w+)\s+WHERE\s+(.+?)\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let keyspace = caps.get(1).unwrap().as_str().to_string();
+            let table = caps.get(2).unwrap().as_str().to_string();
+            let where_str = caps.get(3).unwrap().as_str();
+            
+            let where_clause = Self::parse_where_from_str(where_str)?;
+            
+            Ok(CqlStatement::Delete {
+                keyspace,
+                table,
+                where_clause,
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid DELETE syntax. Expected: DELETE FROM ks.table WHERE pk=x".to_string(),
+            })
+        }
+    }
+    
+    fn parse_batch(query: &str) -> Result<CqlStatement> {
+        // BEGIN BATCH ... APPLY BATCH
+        let re = regex::Regex::new(r"(?is)BEGIN\s+BATCH\s*;?\s*(.+?)\s*APPLY\s+BATCH\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let statements_str = caps.get(1).unwrap().as_str();
+            let mut statements = Vec::new();
+            
+            // 세미콜론으로 분리하여 각 문장 파싱
+            for stmt_str in statements_str.split(';') {
+                let stmt_str = stmt_str.trim();
+                if stmt_str.is_empty() {
+                    continue;
+                }
+                
+                // INSERT 또는 UPDATE만 허용
+                if stmt_str.to_uppercase().starts_with("INSERT") {
+                    statements.push(Self::parse_insert(stmt_str)?);
+                } else if stmt_str.to_uppercase().starts_with("UPDATE") {
+                    statements.push(Self::parse_update(stmt_str)?);
+                } else if stmt_str.to_uppercase().starts_with("DELETE") {
+                    statements.push(Self::parse_delete(stmt_str)?);
+                }
+            }
+            
+            if statements.is_empty() {
+                return Err(CoreDBError::QueryParsingError {
+                    message: "BATCH must contain at least one statement".to_string(),
+                });
+            }
+            
+            Ok(CqlStatement::Batch { statements })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid BATCH syntax. Expected: BEGIN BATCH ... APPLY BATCH".to_string(),
+            })
+        }
+    }
+    
+    /// WHERE 문자열에서 WhereClause 파싱
+    fn parse_where_from_str(where_str: &str) -> Result<WhereClause> {
+        let conditions = Self::parse_conditions_from_str(where_str)?;
+        Ok(WhereClause { conditions })
+    }
+    
+    /// 조건 문자열 파싱
+    fn parse_conditions_from_str(cond_str: &str) -> Result<Vec<Condition>> {
+        let mut conditions = Vec::new();
+        
+        // AND로 분리
+        let and_re = regex::Regex::new(r"(?i)\s+AND\s+")?;
+        for part in and_re.split(cond_str) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            
+            // 연산자 매칭
+            let operators = [
+                (">=", ComparisonOperator::GreaterThanOrEqual),
+                ("<=", ComparisonOperator::LessThanOrEqual),
+                ("!=", ComparisonOperator::NotEqual),
+                ("<>", ComparisonOperator::NotEqual),
+                (">", ComparisonOperator::GreaterThan),
+                ("<", ComparisonOperator::LessThan),
+                ("=", ComparisonOperator::Equal),
+            ];
+            
+            let mut matched = false;
+            for (op_str, op) in operators {
+                if let Some(idx) = part.find(op_str) {
+                    let column = part[..idx].trim().to_string();
+                    let value_str = part[idx + op_str.len()..].trim();
+                    let value = Self::parse_value(value_str)?;
+                    
+                    conditions.push(Condition { column, operator: op, value });
+                    matched = true;
+                    break;
+                }
+            }
+            
+            if !matched {
+                return Err(CoreDBError::QueryParsingError {
+                    message: format!("Invalid condition: {}", part),
+                });
+            }
+        }
+        
+        Ok(conditions)
     }
     
     fn parse_drop_table(query: &str) -> Result<CqlStatement> {
@@ -633,7 +833,7 @@ mod tests {
         let result = CqlParser::parse(query);
         assert!(result.is_ok());
         
-        if let Ok(CqlStatement::Select { keyspace, table, columns, where_clause, limit }) = result {
+        if let Ok(CqlStatement::Select { keyspace, table, columns, where_clause, limit, .. }) = result {
             assert_eq!(keyspace, "test_ks");
             assert_eq!(table, "test_table");
             assert_eq!(columns, vec!["*"]);
