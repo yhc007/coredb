@@ -8,6 +8,7 @@ use crate::storage::{Memtable, SSTable, BlockCache, CacheConfig, CacheKey, Index
 use crate::wal::{CommitLog, Mutation};
 use crate::query::{QueryEngine, CqlStatement, QueryResult};
 use crate::compaction::{CompactionManager, CompactionConfig};
+use crate::persistence::backup::{BackupManager, FullBackup, KeyspaceBackup, TableBackup, TableSchemaBackup, ColumnBackup, RowBackup, IndexBackup, BackupFormat, BackupInfo};
 use crate::error::*;
 
 /// 데이터베이스 설정
@@ -818,6 +819,181 @@ impl CoreDB {
         Ok(())
     }
     
+    /// 전체 데이터베이스 백업 생성
+    pub async fn create_backup(&self, backup_dir: &str, name: &str, format: BackupFormat) -> Result<std::path::PathBuf> {
+        let manager = BackupManager::new(backup_dir);
+        let mut backup = FullBackup::new("coredb");
+        
+        let keyspaces = self.keyspaces.read().await;
+        
+        for (ks_name, keyspace) in keyspaces.iter() {
+            // 시스템 키스페이스는 스킵
+            if ks_name.starts_with("system") {
+                continue;
+            }
+            
+            let mut ks_backup = KeyspaceBackup {
+                name: ks_name.clone(),
+                replication_factor: keyspace.definition.replication_factor,
+                tables: Vec::new(),
+            };
+            
+            let tables = keyspace.tables.read().await;
+            for (table_name, table) in tables.iter() {
+                // 스키마 백업
+                let schema_backup = TableSchemaBackup {
+                    partition_key_columns: table.schema.partition_key.iter().map(|col| ColumnBackup {
+                        name: col.name.clone(),
+                        data_type: format!("{:?}", col.data_type),
+                        is_static: col.is_static,
+                    }).collect(),
+                    clustering_key_columns: table.schema.clustering_key.iter().map(|col| ColumnBackup {
+                        name: col.name.clone(),
+                        data_type: format!("{:?}", col.data_type),
+                        is_static: col.is_static,
+                    }).collect(),
+                    regular_columns: table.schema.regular_columns.iter().map(|col| ColumnBackup {
+                        name: col.name.clone(),
+                        data_type: format!("{:?}", col.data_type),
+                        is_static: col.is_static,
+                    }).collect(),
+                    static_columns: table.schema.static_columns.iter().map(|col| ColumnBackup {
+                        name: col.name.clone(),
+                        data_type: format!("{:?}", col.data_type),
+                        is_static: col.is_static,
+                    }).collect(),
+                };
+                
+                // 행 백업 (Memtable에서)
+                let mut rows = Vec::new();
+                let partitions = table.current_memtable.get_all_partitions();
+                for (_, partition) in partitions {
+                    for entry in partition.rows.iter() {
+                        let row = entry.value();
+                        rows.push(RowBackup::from(row));
+                    }
+                }
+                
+                // SSTable에서도 데이터 로드
+                for sstable in &table.sstables {
+                    for pk in sstable.partition_index.keys() {
+                        if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                            for entry in partition.rows.iter() {
+                                let row = entry.value();
+                                rows.push(RowBackup::from(row));
+                            }
+                        }
+                    }
+                }
+                
+                // 인덱스 백업
+                let indexes: Vec<IndexBackup> = self.index_manager.get_table_indexes(ks_name, table_name)
+                    .iter()
+                    .map(|idx| IndexBackup {
+                        name: idx.name.clone(),
+                        column: idx.column.clone(),
+                    })
+                    .collect();
+                
+                ks_backup.tables.push(TableBackup {
+                    name: table_name.clone(),
+                    schema: schema_backup,
+                    rows,
+                    indexes,
+                });
+            }
+            
+            backup.add_keyspace(ks_backup);
+        }
+        
+        let path = manager.create_backup(&backup, name, format)?;
+        Ok(path)
+    }
+    
+    /// 백업에서 데이터베이스 복원
+    pub async fn restore_from_backup(&self, backup_path: &str) -> Result<RestoreResult> {
+        let manager = BackupManager::new(".");
+        let backup = manager.restore_from_file(backup_path)?;
+        
+        let mut restored_keyspaces = 0;
+        let mut restored_tables = 0;
+        let mut restored_rows = 0;
+        let mut restored_indexes = 0;
+        
+        for ks_backup in &backup.keyspaces {
+            // 키스페이스 생성
+            self.create_keyspace(ks_backup.name.clone(), ks_backup.replication_factor).await?;
+            restored_keyspaces += 1;
+            
+            for table_backup in &ks_backup.tables {
+                // 테이블 생성 CQL 구성
+                let mut columns_sql = Vec::new();
+                
+                for col in &table_backup.schema.partition_key_columns {
+                    columns_sql.push(format!("{} {} PRIMARY KEY", col.name, col.data_type));
+                }
+                for col in &table_backup.schema.clustering_key_columns {
+                    columns_sql.push(format!("{} {}", col.name, col.data_type));
+                }
+                for col in &table_backup.schema.regular_columns {
+                    columns_sql.push(format!("{} {}", col.name, col.data_type));
+                }
+                for col in &table_backup.schema.static_columns {
+                    columns_sql.push(format!("{} {} STATIC", col.name, col.data_type));
+                }
+                
+                let create_table_sql = format!(
+                    "CREATE TABLE {}.{} ({})",
+                    ks_backup.name,
+                    table_backup.name,
+                    columns_sql.join(", ")
+                );
+                
+                self.execute_cql(&create_table_sql).await?;
+                restored_tables += 1;
+                
+                // 데이터 복원
+                let keyspaces = self.keyspaces.read().await;
+                if let Some(ks) = keyspaces.get(&ks_backup.name) {
+                    let tables = ks.tables.read().await;
+                    if let Some(table) = tables.get(&table_backup.name) {
+                        for row_backup in &table_backup.rows {
+                            let row = row_backup.to_row();
+                            table.current_memtable.put(row)?;
+                            restored_rows += 1;
+                        }
+                    }
+                }
+                
+                // 인덱스 복원
+                for idx_backup in &table_backup.indexes {
+                    let create_index_sql = format!(
+                        "CREATE INDEX {} ON {}.{} ({})",
+                        idx_backup.name,
+                        ks_backup.name,
+                        table_backup.name,
+                        idx_backup.column
+                    );
+                    self.execute_cql(&create_index_sql).await?;
+                    restored_indexes += 1;
+                }
+            }
+        }
+        
+        Ok(RestoreResult {
+            keyspaces: restored_keyspaces,
+            tables: restored_tables,
+            rows: restored_rows,
+            indexes: restored_indexes,
+        })
+    }
+    
+    /// 백업 목록 조회
+    pub fn list_backups(&self, backup_dir: &str) -> Result<Vec<BackupInfo>> {
+        let manager = BackupManager::new(backup_dir);
+        manager.list_backups()
+    }
+    
     /// 데이터베이스 종료
     pub async fn shutdown(&self) -> Result<()> {
         // 모든 메모리 테이블 플러시
@@ -831,6 +1007,15 @@ impl CoreDB {
         
         Ok(())
     }
+}
+
+/// 복원 결과
+#[derive(Debug)]
+pub struct RestoreResult {
+    pub keyspaces: usize,
+    pub tables: usize,
+    pub rows: usize,
+    pub indexes: usize,
 }
 
 /// 데이터베이스 통계
