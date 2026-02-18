@@ -20,6 +20,7 @@ CoreDB는 Rust로 작성된 단일 노드 Cassandra 스타일의 NoSQL 데이터
 - **📊 Aggregations**: COUNT, SUM, AVG, MIN, MAX 지원
 - **📦 BATCH**: 여러 쿼리 일괄 실행
 - **🔒 Lightweight Transactions**: IF NOT EXISTS, IF 조건부 실행
+- **💾 백업/복원**: JSON 또는 Binary 포맷으로 전체 DB 백업 및 복원
 
 ## 🏗️ 아키텍처
 
@@ -186,6 +187,22 @@ INSERT INTO demo.users (id, name) VALUES (1, 'Alice') IF NOT EXISTS;
 -- 조건 충족 시에만 업데이트
 UPDATE demo.accounts SET balance = 200 WHERE id = 1 IF balance = 100;
 -- 결과: [applied] = true 또는 false
+```
+
+### 백업 & 복원 (Rust API)
+```rust
+// JSON 포맷으로 백업 (사람이 읽을 수 있음)
+let path = db.create_backup("./backups", "mybackup", BackupFormat::JsonPretty).await?;
+
+// Binary 포맷으로 백업 (5배 작음, 더 빠름)
+let path = db.create_backup("./backups", "mybackup", BackupFormat::Binary).await?;
+
+// 백업 목록 조회
+let backups = db.list_backups("./backups")?;
+
+// 백업에서 복원
+let result = db.restore_from_backup("./backups/mybackup.json").await?;
+println!("복원: {}개 테이블, {}개 행", result.tables, result.rows);
 ```
 
 ### 데이터 조회
