@@ -30,6 +30,12 @@ pub enum CqlStatement {
         where_clause: Option<WhereClause>,
         limit: Option<u32>,
         aggregations: Vec<Aggregation>,
+        distinct: bool,
+        allow_filtering: bool,
+        order_by: Option<OrderBy>,
+        group_by: Vec<String>,
+        page_size: Option<u32>,
+        paging_state: Option<String>,
     },
     Update {
         keyspace: String,
@@ -67,6 +73,25 @@ pub enum CqlStatement {
     Batch {
         statements: Vec<CqlStatement>,
     },
+    /// TRUNCATE - 테이블 전체 삭제
+    Truncate {
+        keyspace: String,
+        table: String,
+    },
+    /// ALTER TABLE
+    AlterTable {
+        keyspace: String,
+        table: String,
+        operation: AlterTableOperation,
+    },
+}
+
+/// ALTER TABLE 연산
+#[derive(Debug, Clone)]
+pub enum AlterTableOperation {
+    AddColumn { name: String, data_type: CassandraDataType },
+    DropColumn { name: String },
+    RenameColumn { old_name: String, new_name: String },
 }
 
 /// 키스페이스 옵션
@@ -128,6 +153,20 @@ pub struct Aggregation {
     pub column: String, // "*" for COUNT(*)
 }
 
+/// ORDER BY 정렬 방향
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+/// ORDER BY 정의
+#[derive(Debug, Clone)]
+pub struct OrderBy {
+    pub column: String,
+    pub order: SortOrder,
+}
+
 /// 간단한 CQL 파서 (실제 구현에서는 더 정교한 파서가 필요)
 pub struct CqlParser;
 
@@ -159,6 +198,10 @@ impl CqlParser {
             Self::parse_drop_index(query)
         } else if query.to_uppercase().starts_with("BEGIN BATCH") {
             Self::parse_batch(query)
+        } else if query.to_uppercase().starts_with("TRUNCATE") {
+            Self::parse_truncate(query)
+        } else if query.to_uppercase().starts_with("ALTER TABLE") {
+            Self::parse_alter_table(query)
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported query type: {}", query),
@@ -326,8 +369,11 @@ impl CqlParser {
     }
     
     fn parse_select(query: &str) -> Result<CqlStatement> {
+        // DISTINCT 체크
+        let distinct = query.to_uppercase().contains("SELECT DISTINCT");
+        
         // 간단한 SELECT 파싱
-        let re = regex::Regex::new(r"(?i)SELECT\s+(.+?)\s+FROM\s+(\w+)\.(\w+)")?;
+        let re = regex::Regex::new(r"(?i)SELECT\s+(?:DISTINCT\s+)?(.+?)\s+FROM\s+(\w+)\.(\w+)")?;
         
         if let Some(caps) = re.captures(query) {
             let columns_str = caps.get(1).unwrap().as_str();
@@ -370,12 +416,40 @@ impl CqlParser {
                 None
             };
             
+            // GROUP BY 파싱
+            let group_by_re = regex::Regex::new(r"(?i)GROUP\s+BY\s+([\w\s,]+?)(?:\s+ORDER|\s+LIMIT|\s+ALLOW|\s*$)")?;
+            let group_by = if let Some(group_caps) = group_by_re.captures(query) {
+                group_caps.get(1).unwrap().as_str()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                vec![]
+            };
+            
+            // ORDER BY 파싱
+            let order_by_re = regex::Regex::new(r"(?i)ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?")?;
+            let order_by = if let Some(order_caps) = order_by_re.captures(query) {
+                let column = order_caps.get(1).unwrap().as_str().to_string();
+                let order = match order_caps.get(2).map(|m| m.as_str().to_uppercase()).as_deref() {
+                    Some("DESC") => SortOrder::Desc,
+                    _ => SortOrder::Asc,
+                };
+                Some(OrderBy { column, order })
+            } else {
+                None
+            };
+            
             // LIMIT 파싱
             let limit = if let Some(limit_match) = regex::Regex::new(r"LIMIT\s+(\d+)")?.captures(query) {
                 Some(limit_match.get(1).unwrap().as_str().parse::<u32>()?)
             } else {
                 None
             };
+            
+            // ALLOW FILTERING 체크
+            let allow_filtering = query.to_uppercase().contains("ALLOW FILTERING");
             
             Ok(CqlStatement::Select {
                 keyspace,
@@ -384,6 +458,12 @@ impl CqlParser {
                 where_clause,
                 limit,
                 aggregations,
+                distinct,
+                allow_filtering,
+                order_by,
+                group_by,
+                page_size: None, // Native Protocol에서 설정
+                paging_state: None,
             })
         } else {
             Err(CoreDBError::QueryParsingError {
@@ -518,6 +598,26 @@ impl CqlParser {
                 continue;
             }
             
+            // IN 절 체크 (col IN (val1, val2, ...))
+            let in_re = regex::Regex::new(r"(?i)(\w+)\s+IN\s*\(([^)]+)\)")?;
+            if let Some(caps) = in_re.captures(part) {
+                let column = caps.get(1).unwrap().as_str().to_string();
+                let values_str = caps.get(2).unwrap().as_str();
+                
+                // 값들 파싱
+                let values: Vec<CassandraValue> = values_str
+                    .split(',')
+                    .map(|v| Self::parse_value(v.trim()))
+                    .collect::<Result<Vec<_>>>()?;
+                
+                conditions.push(Condition {
+                    column,
+                    operator: ComparisonOperator::In,
+                    value: CassandraValue::List(values),
+                });
+                continue;
+            }
+            
             // 연산자 매칭
             let operators = [
                 (">=", ComparisonOperator::GreaterThanOrEqual),
@@ -579,6 +679,67 @@ impl CqlParser {
                 message: "Invalid DROP KEYSPACE syntax".to_string(),
             })
         }
+    }
+    
+    fn parse_truncate(query: &str) -> Result<CqlStatement> {
+        // TRUNCATE [TABLE] keyspace.table
+        let re = regex::Regex::new(r"(?i)TRUNCATE\s+(?:TABLE\s+)?(\w+)\.(\w+)\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            Ok(CqlStatement::Truncate {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                table: caps.get(2).unwrap().as_str().to_string(),
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid TRUNCATE syntax. Expected: TRUNCATE [TABLE] keyspace.table".to_string(),
+            })
+        }
+    }
+    
+    fn parse_alter_table(query: &str) -> Result<CqlStatement> {
+        // ALTER TABLE keyspace.table ADD column type
+        let add_re = regex::Regex::new(r"(?i)ALTER\s+TABLE\s+(\w+)\.(\w+)\s+ADD\s+(\w+)\s+(\w+(?:<[^>]+>)?)\s*;?\s*$")?;
+        if let Some(caps) = add_re.captures(query) {
+            let data_type = Self::parse_data_type(caps.get(4).unwrap().as_str())?;
+            return Ok(CqlStatement::AlterTable {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                table: caps.get(2).unwrap().as_str().to_string(),
+                operation: AlterTableOperation::AddColumn {
+                    name: caps.get(3).unwrap().as_str().to_string(),
+                    data_type,
+                },
+            });
+        }
+        
+        // ALTER TABLE keyspace.table DROP column
+        let drop_re = regex::Regex::new(r"(?i)ALTER\s+TABLE\s+(\w+)\.(\w+)\s+DROP\s+(\w+)\s*;?\s*$")?;
+        if let Some(caps) = drop_re.captures(query) {
+            return Ok(CqlStatement::AlterTable {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                table: caps.get(2).unwrap().as_str().to_string(),
+                operation: AlterTableOperation::DropColumn {
+                    name: caps.get(3).unwrap().as_str().to_string(),
+                },
+            });
+        }
+        
+        // ALTER TABLE keyspace.table RENAME old_col TO new_col
+        let rename_re = regex::Regex::new(r"(?i)ALTER\s+TABLE\s+(\w+)\.(\w+)\s+RENAME\s+(\w+)\s+TO\s+(\w+)\s*;?\s*$")?;
+        if let Some(caps) = rename_re.captures(query) {
+            return Ok(CqlStatement::AlterTable {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                table: caps.get(2).unwrap().as_str().to_string(),
+                operation: AlterTableOperation::RenameColumn {
+                    old_name: caps.get(3).unwrap().as_str().to_string(),
+                    new_name: caps.get(4).unwrap().as_str().to_string(),
+                },
+            });
+        }
+        
+        Err(CoreDBError::QueryParsingError {
+            message: "Invalid ALTER TABLE syntax. Expected: ALTER TABLE ks.tbl ADD/DROP/RENAME ...".to_string(),
+        })
     }
     
     fn parse_use(query: &str) -> Result<CqlStatement> {
@@ -744,7 +905,38 @@ impl CqlParser {
 
     
     fn parse_data_type(type_str: &str) -> Result<CassandraDataType> {
-        match type_str.to_uppercase().as_str() {
+        let type_upper = type_str.to_uppercase();
+        let type_trimmed = type_upper.trim();
+        
+        // Collection 타입 체크
+        // list<type>
+        if let Some(inner) = type_trimmed.strip_prefix("LIST<").and_then(|s| s.strip_suffix(">")) {
+            let inner_type = Self::parse_data_type(inner)?;
+            return Ok(CassandraDataType::List(Box::new(inner_type)));
+        }
+        
+        // set<type>
+        if let Some(inner) = type_trimmed.strip_prefix("SET<").and_then(|s| s.strip_suffix(">")) {
+            let inner_type = Self::parse_data_type(inner)?;
+            return Ok(CassandraDataType::Set(Box::new(inner_type)));
+        }
+        
+        // map<key_type, value_type>
+        if let Some(inner) = type_trimmed.strip_prefix("MAP<").and_then(|s| s.strip_suffix(">")) {
+            // 콤마로 분리 (첫 번째 콤마만)
+            if let Some(comma_pos) = inner.find(',') {
+                let key_type = Self::parse_data_type(&inner[..comma_pos].trim())?;
+                let value_type = Self::parse_data_type(&inner[comma_pos+1..].trim())?;
+                return Ok(CassandraDataType::Map(Box::new(key_type), Box::new(value_type)));
+            }
+        }
+        
+        // frozen<type> - 내부 타입 반환
+        if let Some(inner) = type_trimmed.strip_prefix("FROZEN<").and_then(|s| s.strip_suffix(">")) {
+            return Self::parse_data_type(inner);
+        }
+        
+        match type_trimmed {
             "TEXT" | "VARCHAR" => Ok(CassandraDataType::Text),
             "INT" => Ok(CassandraDataType::Int),
             "BIGINT" => Ok(CassandraDataType::BigInt),
@@ -764,6 +956,42 @@ impl CqlParser {
         
         if value == "NULL" {
             Ok(CassandraValue::Null)
+        } else if value.starts_with('[') && value.ends_with(']') {
+            // List: [val1, val2, ...]
+            let inner = &value[1..value.len()-1];
+            if inner.is_empty() {
+                return Ok(CassandraValue::List(vec![]));
+            }
+            let items: Vec<CassandraValue> = inner
+                .split(',')
+                .map(|v| Self::parse_value(v.trim()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(CassandraValue::List(items))
+        } else if value.starts_with('{') && value.ends_with('}') {
+            let inner = &value[1..value.len()-1];
+            if inner.is_empty() {
+                return Ok(CassandraValue::Set(vec![]));
+            }
+            // Map인지 Set인지 구분 (콜론 있으면 Map)
+            if inner.contains(':') {
+                // Map: {key1: val1, key2: val2}
+                let mut map = std::collections::HashMap::new();
+                for pair in inner.split(',') {
+                    if let Some(colon_pos) = pair.find(':') {
+                        let key = pair[..colon_pos].trim().trim_matches('\'').to_string();
+                        let val = Self::parse_value(&pair[colon_pos+1..])?;
+                        map.insert(key, val);
+                    }
+                }
+                Ok(CassandraValue::Map(map))
+            } else {
+                // Set: {val1, val2, ...}
+                let items: Vec<CassandraValue> = inner
+                    .split(',')
+                    .map(|v| Self::parse_value(v.trim()))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CassandraValue::Set(items))
+            }
         } else if value.starts_with('\'') && value.ends_with('\'') {
             // 문자열
             let string_value = value[1..value.len()-1].to_string();

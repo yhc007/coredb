@@ -55,8 +55,8 @@ impl QueryEngine {
             CqlStatement::Insert { keyspace, table, values, ttl, if_not_exists } => {
                 self.insert_row(keyspace, table, values, ttl, if_not_exists).await
             },
-            CqlStatement::Select { keyspace, table, columns, where_clause, limit, aggregations } => {
-                self.select_rows(keyspace, table, columns, where_clause, limit, aggregations).await
+            CqlStatement::Select { keyspace, table, columns, where_clause, limit, aggregations, distinct, allow_filtering, order_by, group_by, page_size, paging_state } => {
+                self.select_rows(keyspace, table, columns, where_clause, limit, aggregations, distinct, allow_filtering, order_by, group_by, page_size, paging_state).await
             },
             CqlStatement::Update { keyspace, table, values, where_clause, if_conditions } => {
                 self.update_row(keyspace, table, values, where_clause, if_conditions).await
@@ -80,7 +80,125 @@ impl QueryEngine {
             CqlStatement::CreateIndex { .. } | CqlStatement::DropIndex { .. } => {
                 Ok(QueryResult::Success)
             },
+            CqlStatement::Truncate { keyspace, table } => {
+                self.truncate_table(keyspace, table).await
+            },
+            CqlStatement::AlterTable { keyspace, table, operation } => {
+                self.alter_table(keyspace, table, operation).await
+            },
         }
+    }
+    
+    /// ALTER TABLE - 테이블 스키마 변경
+    async fn alter_table(&mut self, keyspace: String, table: String, operation: crate::query::parser::AlterTableOperation) -> Result<QueryResult> {
+        use crate::query::parser::AlterTableOperation;
+        
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(&keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.clone(),
+        })?;
+        
+        let mut tables = ks.tables.write().await;
+        
+        let tbl = tables.get_mut(&table).ok_or_else(|| CoreDBError::TableNotFound {
+            table: table.clone(),
+        })?;
+        
+        // 스키마 수정 (Arc를 새로 만들어서 교체)
+        let mut new_schema = (*tbl.schema).clone();
+        
+        // 모든 컬럼 이름 수집 (중복 체크용)
+        let all_column_names: Vec<String> = new_schema.partition_key.iter()
+            .chain(new_schema.clustering_key.iter())
+            .chain(new_schema.regular_columns.iter())
+            .chain(new_schema.static_columns.iter())
+            .map(|c| c.name.clone())
+            .collect();
+        
+        match operation {
+            AlterTableOperation::AddColumn { name, data_type } => {
+                // 이미 존재하는지 확인
+                if all_column_names.contains(&name) {
+                    return Err(CoreDBError::QueryExecutionError {
+                        message: format!("Column '{}' already exists", name),
+                    });
+                }
+                // regular_columns에 추가
+                new_schema.regular_columns.push(crate::schema::ColumnDefinition {
+                    name,
+                    data_type,
+                    is_static: false,
+                });
+            },
+            AlterTableOperation::DropColumn { name } => {
+                // 기본 키는 삭제 불가
+                if new_schema.partition_key.iter().any(|c| c.name == name) ||
+                   new_schema.clustering_key.iter().any(|c| c.name == name) {
+                    return Err(CoreDBError::QueryExecutionError {
+                        message: format!("Cannot drop primary key column '{}'", name),
+                    });
+                }
+                // regular_columns에서 삭제
+                new_schema.regular_columns.retain(|c| c.name != name);
+                new_schema.static_columns.retain(|c| c.name != name);
+            },
+            AlterTableOperation::RenameColumn { old_name, new_name } => {
+                // 컬럼 이름 변경 (모든 컬럼 타입에서)
+                for col in &mut new_schema.partition_key {
+                    if col.name == old_name {
+                        col.name = new_name.clone();
+                    }
+                }
+                for col in &mut new_schema.clustering_key {
+                    if col.name == old_name {
+                        col.name = new_name.clone();
+                    }
+                }
+                for col in &mut new_schema.regular_columns {
+                    if col.name == old_name {
+                        col.name = new_name.clone();
+                    }
+                }
+                for col in &mut new_schema.static_columns {
+                    if col.name == old_name {
+                        col.name = new_name.clone();
+                    }
+                }
+            },
+        }
+        
+        tbl.schema = std::sync::Arc::new(new_schema);
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// TRUNCATE - 테이블의 모든 데이터 삭제
+    async fn truncate_table(&mut self, keyspace: String, table: String) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(&keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.clone(),
+        })?;
+        
+        let mut tables = ks.tables.write().await;
+        
+        let tbl = tables.get_mut(&table).ok_or_else(|| CoreDBError::TableNotFound {
+            table: table.clone(),
+        })?;
+        
+        // 새 빈 memtable로 교체
+        let new_memtable = Arc::new(crate::storage::Memtable::new(tbl.schema.clone()));
+        tbl.current_memtable = new_memtable;
+        tbl.memtables.clear();
+        
+        // SSTable들 삭제
+        for sstable in &tbl.sstables {
+            let _ = sstable.delete().await;
+        }
+        tbl.sstables.clear();
+        
+        Ok(QueryResult::Success)
     }
     
     async fn create_keyspace(&mut self, name: String, options: crate::query::parser::KeyspaceOptions) -> Result<QueryResult> {
@@ -251,7 +369,9 @@ impl QueryEngine {
         Ok(QueryResult::Success)
     }
     
-    async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>, aggregations: Vec<crate::query::parser::Aggregation>) -> Result<QueryResult> {
+    async fn select_rows(&mut self, keyspace: String, table: String, columns: Vec<String>, where_clause: Option<crate::query::parser::WhereClause>, limit: Option<u32>, aggregations: Vec<crate::query::parser::Aggregation>, distinct: bool, _allow_filtering: bool, order_by: Option<crate::query::parser::OrderBy>, group_by: Vec<String>, page_size: Option<u32>, paging_state: Option<String>) -> Result<QueryResult> {
+        // Note: allow_filtering은 현재 무시됨 (단일 노드 DB에서는 항상 필터링 가능)
+        // page_size와 paging_state는 Native Protocol 레벨에서 처리됨
         let keyspace_name = if keyspace.is_empty() {
             self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
                 message: "No keyspace selected".to_string(),
@@ -447,12 +567,52 @@ impl QueryEngine {
             query_rows.push(QueryRow { columns: final_cells });
         }
         
+        // DISTINCT 처리 - 중복 행 제거
+        if distinct {
+            let mut seen = std::collections::HashSet::new();
+            query_rows.retain(|row| {
+                // 행의 모든 컬럼 값을 문자열로 변환하여 해시
+                let key: String = row.columns.iter()
+                    .map(|(k, v)| format!("{}:{:?}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                seen.insert(key)
+            });
+        }
+        
+        // ORDER BY 정렬
+        if let Some(ref ob) = order_by {
+            use crate::query::parser::SortOrder;
+            query_rows.sort_by(|a, b| {
+                let val_a = a.columns.get(&ob.column);
+                let val_b = b.columns.get(&ob.column);
+                
+                let cmp = match (val_a, val_b) {
+                    (Some(va), Some(vb)) => Self::compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                
+                if ob.order == SortOrder::Desc {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+        }
+        
         // LIMIT 적용
         if let Some(l) = limit {
             query_rows.truncate(l as usize);
         }
         
-        // Aggregation 처리
+        // GROUP BY + Aggregation 처리
+        if !group_by.is_empty() && !aggregations.is_empty() {
+            return self.compute_grouped_aggregations(&query_rows, &group_by, &aggregations);
+        }
+        
+        // Aggregation 처리 (GROUP BY 없이)
         if !aggregations.is_empty() {
             return self.compute_aggregations(&query_rows, &aggregations);
         }
@@ -536,6 +696,118 @@ impl QueryEngine {
         }
         
         Ok(QueryResult::Rows(vec![QueryRow { columns: result_cells }]))
+    }
+    
+    /// GROUP BY + Aggregation 계산
+    fn compute_grouped_aggregations(&self, rows: &[QueryRow], group_by: &[String], aggregations: &[crate::query::parser::Aggregation]) -> Result<QueryResult> {
+        use crate::query::parser::AggregationFunc;
+        
+        // 그룹별로 행 분류
+        let mut groups: HashMap<String, Vec<&QueryRow>> = HashMap::new();
+        
+        for row in rows {
+            // 그룹 키 생성
+            let group_key: String = group_by.iter()
+                .map(|col| {
+                    row.columns.get(col)
+                        .map(|v| format!("{:?}", v))
+                        .unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            
+            groups.entry(group_key).or_default().push(row);
+        }
+        
+        // 각 그룹에 대해 aggregation 수행
+        let mut result_rows = Vec::new();
+        
+        for (group_key, group_rows) in groups {
+            let mut result_cells = HashMap::new();
+            
+            // 그룹 키 컬럼 값 추가
+            if let Some(first_row) = group_rows.first() {
+                for col in group_by {
+                    if let Some(val) = first_row.columns.get(col) {
+                        result_cells.insert(col.clone(), val.clone());
+                    }
+                }
+            }
+            
+            // Aggregation 계산
+            for agg in aggregations {
+                let agg_name = match agg.func {
+                    AggregationFunc::Count => format!("count({})", agg.column),
+                    AggregationFunc::Sum => format!("sum({})", agg.column),
+                    AggregationFunc::Avg => format!("avg({})", agg.column),
+                    AggregationFunc::Min => format!("min({})", agg.column),
+                    AggregationFunc::Max => format!("max({})", agg.column),
+                };
+                
+                let value = match agg.func {
+                    AggregationFunc::Count => {
+                        if agg.column == "*" {
+                            CassandraValue::BigInt(group_rows.len() as i64)
+                        } else {
+                            let count = group_rows.iter()
+                                .filter(|r| r.columns.contains_key(&agg.column))
+                                .count();
+                            CassandraValue::BigInt(count as i64)
+                        }
+                    },
+                    AggregationFunc::Sum => {
+                        let sum: i64 = group_rows.iter()
+                            .filter_map(|r| r.columns.get(&agg.column))
+                            .filter_map(|v| match v {
+                                CassandraValue::Int(i) => Some(*i as i64),
+                                CassandraValue::BigInt(i) => Some(*i),
+                                CassandraValue::Double(d) => Some(*d as i64),
+                                _ => None,
+                            })
+                            .sum();
+                        CassandraValue::BigInt(sum)
+                    },
+                    AggregationFunc::Avg => {
+                        let values: Vec<f64> = group_rows.iter()
+                            .filter_map(|r| r.columns.get(&agg.column))
+                            .filter_map(|v| match v {
+                                CassandraValue::Int(i) => Some(*i as f64),
+                                CassandraValue::BigInt(i) => Some(*i as f64),
+                                CassandraValue::Double(d) => Some(*d),
+                                _ => None,
+                            })
+                            .collect();
+                        
+                        if values.is_empty() {
+                            CassandraValue::Null
+                        } else {
+                            let avg = values.iter().sum::<f64>() / values.len() as f64;
+                            CassandraValue::Double(avg)
+                        }
+                    },
+                    AggregationFunc::Min => {
+                        let min = group_rows.iter()
+                            .filter_map(|r| r.columns.get(&agg.column))
+                            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                            .cloned();
+                        min.unwrap_or(CassandraValue::Null)
+                    },
+                    AggregationFunc::Max => {
+                        let max = group_rows.iter()
+                            .filter_map(|r| r.columns.get(&agg.column))
+                            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                            .cloned();
+                        max.unwrap_or(CassandraValue::Null)
+                    },
+                };
+                
+                result_cells.insert(agg_name, value);
+            }
+            
+            result_rows.push(QueryRow { columns: result_cells });
+        }
+        
+        Ok(QueryResult::Rows(result_rows))
     }
     
     async fn update_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, where_clause: crate::query::parser::WhereClause, if_conditions: Option<Vec<crate::query::parser::Condition>>) -> Result<QueryResult> {
@@ -849,7 +1121,11 @@ impl QueryEngine {
                 }
             },
             ComparisonOperator::In => {
-                value == &condition.value
+                // condition.value는 List이고, value가 그 리스트에 포함되어 있는지 확인
+                match &condition.value {
+                    CassandraValue::List(values) => values.contains(value),
+                    _ => value == &condition.value,
+                }
             },
         }
     }
@@ -987,6 +1263,12 @@ mod tests {
             }),
             limit: None,
             aggregations: vec![],
+            distinct: false,
+            allow_filtering: false,
+            order_by: None,
+            group_by: vec![],
+            page_size: None,
+            paging_state: None,
         };
         
         let result = engine.execute(select).await.unwrap();
