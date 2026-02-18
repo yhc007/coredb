@@ -150,6 +150,16 @@ fn hash_cassandra_value<H: Hasher>(value: &CassandraValue, state: &mut H) {
             state.write_u8(12);
             c.hash(state);
         },
+        CassandraValue::UDT(fields) => {
+            state.write_u8(13);
+            // UDT 필드들을 정렬하여 해시
+            let mut keys: Vec<&String> = fields.keys().collect();
+            keys.sort();
+            for k in keys {
+                k.hash(state);
+                hash_cassandra_value(fields.get(k).unwrap(), state);
+            }
+        },
     }
 }
 

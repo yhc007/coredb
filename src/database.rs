@@ -47,6 +47,7 @@ pub struct Keyspace {
     pub name: String,
     pub definition: KeyspaceDefinition,
     pub tables: Arc<RwLock<HashMap<String, Table>>>,
+    pub user_types: Arc<RwLock<HashMap<String, crate::schema::UserDefinedType>>>,
 }
 
 /// 테이블
@@ -494,6 +495,7 @@ impl CoreDB {
                 strategy: ReplicationStrategy::SimpleStrategy,
             },
             tables: Arc::new(RwLock::new(HashMap::new())),
+            user_types: Arc::new(RwLock::new(HashMap::new())),
         };
         
         let mut keyspaces = self.keyspaces.write().await;

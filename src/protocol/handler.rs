@@ -244,6 +244,10 @@ fn encode_cassandra_value(value: &CassandraValue) -> Bytes {
             buf.extend_from_slice(format!("{:?}", value).as_bytes());
         },
         CassandraValue::Counter(c) => buf.extend_from_slice(&c.to_be_bytes()),
+        CassandraValue::UDT(fields) => {
+            // UDT는 Map과 유사하게 문자열로 변환
+            buf.extend_from_slice(format!("{:?}", fields).as_bytes());
+        },
     }
     
     buf.freeze()

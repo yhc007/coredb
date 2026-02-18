@@ -86,7 +86,64 @@ impl QueryEngine {
             CqlStatement::AlterTable { keyspace, table, operation } => {
                 self.alter_table(keyspace, table, operation).await
             },
+            CqlStatement::CreateType { keyspace, name, fields } => {
+                self.create_type(keyspace, name, fields).await
+            },
+            CqlStatement::DropType { keyspace, name } => {
+                self.drop_type(keyspace, name).await
+            },
         }
+    }
+    
+    /// CREATE TYPE - UDT 생성
+    async fn create_type(&mut self, keyspace: String, name: String, fields: Vec<(String, crate::schema::CassandraDataType)>) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(&keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.clone(),
+        })?;
+        
+        let mut user_types = ks.user_types.write().await;
+        
+        if user_types.contains_key(&name) {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Type '{}' already exists", name),
+            });
+        }
+        
+        let udt = crate::schema::UserDefinedType {
+            keyspace: keyspace.clone(),
+            name: name.clone(),
+            fields: fields.into_iter().map(|(n, t)| crate::schema::UDTField {
+                name: n,
+                data_type: t,
+            }).collect(),
+        };
+        
+        user_types.insert(name, udt);
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// DROP TYPE - UDT 삭제
+    async fn drop_type(&mut self, keyspace: String, name: String) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(&keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.clone(),
+        })?;
+        
+        let mut user_types = ks.user_types.write().await;
+        
+        if !user_types.contains_key(&name) {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Type '{}' does not exist", name),
+            });
+        }
+        
+        user_types.remove(&name);
+        
+        Ok(QueryResult::Success)
     }
     
     /// ALTER TABLE - 테이블 스키마 변경
@@ -218,6 +275,7 @@ impl QueryEngine {
                 strategy: crate::schema::ReplicationStrategy::SimpleStrategy,
             },
             tables: Arc::new(RwLock::new(HashMap::new())),
+            user_types: Arc::new(RwLock::new(HashMap::new())),
         };
         
         keyspaces.insert(name, keyspace);

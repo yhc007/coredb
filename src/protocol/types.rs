@@ -307,6 +307,17 @@ pub fn encode_value(buf: &mut BytesMut, value: &CassandraValue) {
             write_int(buf, 8);
             buf.put_i64(*c);
         },
+        CassandraValue::UDT(fields) => {
+            // UDT는 Map과 유사하게 인코딩
+            let mut temp = BytesMut::new();
+            write_int(&mut temp, fields.len() as i32);
+            for (k, v) in fields {
+                write_string(&mut temp, k);
+                encode_value(&mut temp, v);
+            }
+            write_int(buf, temp.len() as i32);
+            buf.extend_from_slice(&temp);
+        },
     }
 }
 

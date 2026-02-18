@@ -84,6 +84,17 @@ pub enum CqlStatement {
         table: String,
         operation: AlterTableOperation,
     },
+    /// CREATE TYPE (UDT)
+    CreateType {
+        keyspace: String,
+        name: String,
+        fields: Vec<(String, CassandraDataType)>,
+    },
+    /// DROP TYPE
+    DropType {
+        keyspace: String,
+        name: String,
+    },
 }
 
 /// ALTER TABLE 연산
@@ -203,6 +214,10 @@ impl CqlParser {
             Self::parse_truncate(query)
         } else if query.to_uppercase().starts_with("ALTER TABLE") {
             Self::parse_alter_table(query)
+        } else if query.to_uppercase().starts_with("CREATE TYPE") {
+            Self::parse_create_type(query)
+        } else if query.to_uppercase().starts_with("DROP TYPE") {
+            Self::parse_drop_type(query)
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported query type: {}", query),
@@ -768,6 +783,53 @@ impl CqlParser {
         
         Err(CoreDBError::QueryParsingError {
             message: "Invalid ALTER TABLE syntax. Expected: ALTER TABLE ks.tbl ADD/DROP/RENAME ...".to_string(),
+        })
+    }
+    
+    fn parse_create_type(query: &str) -> Result<CqlStatement> {
+        // CREATE TYPE keyspace.typename (field1 type1, field2 type2, ...)
+        let re = regex::Regex::new(r"(?i)CREATE\s+TYPE\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let keyspace = caps.get(1).unwrap().as_str().to_string();
+            let name = caps.get(2).unwrap().as_str().to_string();
+            let fields_str = caps.get(3).unwrap().as_str();
+            
+            let mut fields = Vec::new();
+            for field_def in fields_str.split(',') {
+                let parts: Vec<&str> = field_def.trim().splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    let field_name = parts[0].trim().to_string();
+                    let data_type = Self::parse_data_type(parts[1].trim())?;
+                    fields.push((field_name, data_type));
+                }
+            }
+            
+            return Ok(CqlStatement::CreateType {
+                keyspace,
+                name,
+                fields,
+            });
+        }
+        
+        Err(CoreDBError::QueryParsingError {
+            message: "Invalid CREATE TYPE syntax. Expected: CREATE TYPE ks.name (field1 type1, ...)".to_string(),
+        })
+    }
+    
+    fn parse_drop_type(query: &str) -> Result<CqlStatement> {
+        // DROP TYPE keyspace.typename
+        let re = regex::Regex::new(r"(?i)DROP\s+TYPE\s+(\w+)\.(\w+)\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            return Ok(CqlStatement::DropType {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                name: caps.get(2).unwrap().as_str().to_string(),
+            });
+        }
+        
+        Err(CoreDBError::QueryParsingError {
+            message: "Invalid DROP TYPE syntax. Expected: DROP TYPE ks.name".to_string(),
         })
     }
     

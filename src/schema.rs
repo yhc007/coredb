@@ -18,6 +18,22 @@ pub enum CassandraDataType {
     Map(Box<CassandraDataType>, Box<CassandraDataType>),
     List(Box<CassandraDataType>),
     Set(Box<CassandraDataType>),
+    UDT(String, String),  // (keyspace, type_name)
+}
+
+/// User Defined Type 정의
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDefinedType {
+    pub keyspace: String,
+    pub name: String,
+    pub fields: Vec<UDTField>,
+}
+
+/// UDT 필드
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UDTField {
+    pub name: String,
+    pub data_type: CassandraDataType,
 }
 
 /// 컬럼 정의
@@ -73,6 +89,7 @@ pub enum CassandraValue {
     Map(HashMap<String, CassandraValue>),  // HashMap doesn't implement Ord
     List(Vec<CassandraValue>),
     Set(Vec<CassandraValue>),
+    UDT(HashMap<String, CassandraValue>),  // UDT 필드명 -> 값
 }
 
 // Custom Eq implementation for CassandraValue
@@ -98,6 +115,7 @@ impl PartialOrd for CassandraValue {
             (Set(a), Set(b)) => a.partial_cmp(b),
             (Null, Null) => Some(Ordering::Equal),
             (Map(_), Map(_)) => Some(Ordering::Equal), // Maps cannot be ordered
+            (UDT(_), UDT(_)) => Some(Ordering::Equal), // UDTs cannot be ordered
             _ => None,
         }
     }
@@ -141,6 +159,13 @@ impl CassandraValue {
                 let mut size = 8; // length prefix
                 for item in s {
                     size += item.serialized_size();
+                }
+                size
+            },
+            CassandraValue::UDT(fields) => {
+                let mut size = 8; // length prefix
+                for (k, v) in fields {
+                    size += 8 + k.len() as u64 + v.serialized_size();
                 }
                 size
             },
