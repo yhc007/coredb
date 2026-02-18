@@ -110,6 +110,81 @@ pub enum CqlStatement {
         keyspace: String,
         name: String,
     },
+    // ========================================================================
+    // Authentication & Authorization
+    // ========================================================================
+    /// CREATE USER
+    CreateUser {
+        name: String,
+        password: String,
+        is_superuser: bool,
+        if_not_exists: bool,
+    },
+    /// ALTER USER
+    AlterUser {
+        name: String,
+        password: Option<String>,
+        is_superuser: Option<bool>,
+    },
+    /// DROP USER
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    /// LIST USERS
+    ListUsers,
+    /// CREATE ROLE
+    CreateRole {
+        name: String,
+        is_superuser: bool,
+        can_login: bool,
+        password: Option<String>,
+        if_not_exists: bool,
+    },
+    /// DROP ROLE
+    DropRole {
+        name: String,
+        if_exists: bool,
+    },
+    /// GRANT permission
+    Grant {
+        permission: crate::schema::PermissionType,
+        resource: crate::schema::Resource,
+        to_role: String,
+    },
+    /// REVOKE permission
+    Revoke {
+        permission: crate::schema::PermissionType,
+        resource: crate::schema::Resource,
+        from_role: String,
+    },
+    /// LIST ROLES
+    ListRoles {
+        of_user: Option<String>,
+    },
+    /// LIST PERMISSIONS
+    ListPermissions {
+        of_role: Option<String>,
+        on_resource: Option<crate::schema::Resource>,
+    },
+    // ========================================================================
+    // Schema Information
+    // ========================================================================
+    /// DESCRIBE KEYSPACES
+    DescribeKeyspaces,
+    /// DESCRIBE KEYSPACE
+    DescribeKeyspace {
+        name: String,
+    },
+    /// DESCRIBE TABLE
+    DescribeTable {
+        keyspace: String,
+        table: String,
+    },
+    /// DESCRIBE TABLES
+    DescribeTables {
+        keyspace: Option<String>,
+    },
 }
 
 /// ALTER TABLE 연산
@@ -237,6 +312,37 @@ impl CqlParser {
             Self::parse_create_materialized_view(query)
         } else if query.to_uppercase().starts_with("DROP MATERIALIZED VIEW") {
             Self::parse_drop_materialized_view(query)
+        // Authentication & Authorization
+        } else if query.to_uppercase().starts_with("CREATE USER") {
+            Self::parse_create_user(query)
+        } else if query.to_uppercase().starts_with("ALTER USER") {
+            Self::parse_alter_user(query)
+        } else if query.to_uppercase().starts_with("DROP USER") {
+            Self::parse_drop_user(query)
+        } else if query.to_uppercase().starts_with("LIST USERS") {
+            Ok(CqlStatement::ListUsers)
+        } else if query.to_uppercase().starts_with("CREATE ROLE") {
+            Self::parse_create_role(query)
+        } else if query.to_uppercase().starts_with("DROP ROLE") {
+            Self::parse_drop_role(query)
+        } else if query.to_uppercase().starts_with("GRANT") {
+            Self::parse_grant(query)
+        } else if query.to_uppercase().starts_with("REVOKE") {
+            Self::parse_revoke(query)
+        } else if query.to_uppercase().starts_with("LIST ROLES") {
+            Self::parse_list_roles(query)
+        } else if query.to_uppercase().starts_with("LIST PERMISSIONS") {
+            Self::parse_list_permissions(query)
+        // Schema Information (DESCRIBE)
+        } else if query.to_uppercase().starts_with("DESCRIBE KEYSPACES") || query.to_uppercase().starts_with("DESC KEYSPACES") {
+            Ok(CqlStatement::DescribeKeyspaces)
+        } else if query.to_uppercase().starts_with("DESCRIBE KEYSPACE") || query.to_uppercase().starts_with("DESC KEYSPACE") {
+            Self::parse_describe_keyspace(query)
+        } else if query.to_uppercase().starts_with("DESCRIBE TABLES") || query.to_uppercase().starts_with("DESC TABLES") {
+            Self::parse_describe_tables(query)
+        } else if query.to_uppercase().starts_with("DESCRIBE TABLE") || query.to_uppercase().starts_with("DESC TABLE") 
+                || query.to_uppercase().starts_with("DESCRIBE ") || query.to_uppercase().starts_with("DESC ") {
+            Self::parse_describe_table(query)
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported query type: {}", query),
@@ -1203,6 +1309,327 @@ impl CqlParser {
         } else {
             // 기본적으로 문자열로 처리
             Ok(CassandraValue::Text(value.to_string()))
+        }
+    }
+
+    // ========================================================================
+    // Authentication & Authorization Parsing
+    // ========================================================================
+    
+    /// CREATE USER username WITH PASSWORD 'password' [SUPERUSER | NOSUPERUSER] [IF NOT EXISTS]
+    fn parse_create_user(query: &str) -> Result<CqlStatement> {
+        let upper = query.to_uppercase();
+        let if_not_exists = upper.contains("IF NOT EXISTS");
+        let is_superuser = upper.contains("SUPERUSER") && !upper.contains("NOSUPERUSER");
+        
+        // Parse username and password
+        let re = regex::Regex::new(r"(?i)CREATE\s+USER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+WITH\s+PASSWORD\s+'([^']+)'")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let name = caps.get(1).unwrap().as_str().to_string();
+            let password = caps.get(2).unwrap().as_str().to_string();
+            
+            Ok(CqlStatement::CreateUser {
+                name,
+                password,
+                is_superuser,
+                if_not_exists,
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid CREATE USER syntax. Expected: CREATE USER name WITH PASSWORD 'password'".to_string(),
+            })
+        }
+    }
+    
+    /// ALTER USER username WITH PASSWORD 'newpassword' | SUPERUSER | NOSUPERUSER
+    fn parse_alter_user(query: &str) -> Result<CqlStatement> {
+        let upper = query.to_uppercase();
+        
+        // Parse username
+        let name_re = regex::Regex::new(r"(?i)ALTER\s+USER\s+(\w+)")?;
+        let name = if let Some(caps) = name_re.captures(query) {
+            caps.get(1).unwrap().as_str().to_string()
+        } else {
+            return Err(CoreDBError::QueryParsingError {
+                message: "Invalid ALTER USER syntax".to_string(),
+            });
+        };
+        
+        // Parse password if present
+        let password = if let Some(caps) = regex::Regex::new(r"(?i)WITH\s+PASSWORD\s+'([^']+)'")?.captures(query) {
+            Some(caps.get(1).unwrap().as_str().to_string())
+        } else {
+            None
+        };
+        
+        // Parse superuser status
+        let is_superuser = if upper.contains("NOSUPERUSER") {
+            Some(false)
+        } else if upper.contains("SUPERUSER") {
+            Some(true)
+        } else {
+            None
+        };
+        
+        Ok(CqlStatement::AlterUser {
+            name,
+            password,
+            is_superuser,
+        })
+    }
+    
+    /// DROP USER [IF EXISTS] username
+    fn parse_drop_user(query: &str) -> Result<CqlStatement> {
+        let upper = query.to_uppercase();
+        let if_exists = upper.contains("IF EXISTS");
+        
+        let re = regex::Regex::new(r"(?i)DROP\s+USER\s+(?:IF\s+EXISTS\s+)?(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let name = caps.get(1).unwrap().as_str().to_string();
+            Ok(CqlStatement::DropUser { name, if_exists })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid DROP USER syntax".to_string(),
+            })
+        }
+    }
+    
+    /// CREATE ROLE name [WITH SUPERUSER = true/false] [AND LOGIN = true/false] [AND PASSWORD = 'password']
+    fn parse_create_role(query: &str) -> Result<CqlStatement> {
+        let upper = query.to_uppercase();
+        let if_not_exists = upper.contains("IF NOT EXISTS");
+        
+        // Parse role name
+        let name_re = regex::Regex::new(r"(?i)CREATE\s+ROLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)")?;
+        let name = if let Some(caps) = name_re.captures(query) {
+            caps.get(1).unwrap().as_str().to_string()
+        } else {
+            return Err(CoreDBError::QueryParsingError {
+                message: "Invalid CREATE ROLE syntax".to_string(),
+            });
+        };
+        
+        // Parse options
+        let is_superuser = upper.contains("SUPERUSER = TRUE") || upper.contains("SUPERUSER=TRUE");
+        let can_login = upper.contains("LOGIN = TRUE") || upper.contains("LOGIN=TRUE");
+        
+        let password = if let Some(caps) = regex::Regex::new(r"(?i)PASSWORD\s*=\s*'([^']+)'")?.captures(query) {
+            Some(caps.get(1).unwrap().as_str().to_string())
+        } else {
+            None
+        };
+        
+        Ok(CqlStatement::CreateRole {
+            name,
+            is_superuser,
+            can_login,
+            password,
+            if_not_exists,
+        })
+    }
+    
+    /// DROP ROLE [IF EXISTS] name
+    fn parse_drop_role(query: &str) -> Result<CqlStatement> {
+        let upper = query.to_uppercase();
+        let if_exists = upper.contains("IF EXISTS");
+        
+        let re = regex::Regex::new(r"(?i)DROP\s+ROLE\s+(?:IF\s+EXISTS\s+)?(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let name = caps.get(1).unwrap().as_str().to_string();
+            Ok(CqlStatement::DropRole { name, if_exists })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid DROP ROLE syntax".to_string(),
+            })
+        }
+    }
+    
+    /// GRANT permission ON resource TO role
+    fn parse_grant(query: &str) -> Result<CqlStatement> {
+        // GRANT SELECT ON keyspace.table TO role
+        // GRANT ALL ON KEYSPACE ks TO role
+        // GRANT MODIFY ON ALL KEYSPACES TO role
+        let re = regex::Regex::new(r"(?i)GRANT\s+(\w+)\s+ON\s+(.+?)\s+TO\s+(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let permission = Self::parse_permission_type(caps.get(1).unwrap().as_str())?;
+            let resource = Self::parse_resource(caps.get(2).unwrap().as_str())?;
+            let to_role = caps.get(3).unwrap().as_str().to_string();
+            
+            Ok(CqlStatement::Grant {
+                permission,
+                resource,
+                to_role,
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid GRANT syntax. Expected: GRANT permission ON resource TO role".to_string(),
+            })
+        }
+    }
+    
+    /// REVOKE permission ON resource FROM role
+    fn parse_revoke(query: &str) -> Result<CqlStatement> {
+        let re = regex::Regex::new(r"(?i)REVOKE\s+(\w+)\s+ON\s+(.+?)\s+FROM\s+(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let permission = Self::parse_permission_type(caps.get(1).unwrap().as_str())?;
+            let resource = Self::parse_resource(caps.get(2).unwrap().as_str())?;
+            let from_role = caps.get(3).unwrap().as_str().to_string();
+            
+            Ok(CqlStatement::Revoke {
+                permission,
+                resource,
+                from_role,
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid REVOKE syntax. Expected: REVOKE permission ON resource FROM role".to_string(),
+            })
+        }
+    }
+    
+    /// LIST ROLES [OF user]
+    fn parse_list_roles(query: &str) -> Result<CqlStatement> {
+        let re = regex::Regex::new(r"(?i)LIST\s+ROLES(?:\s+OF\s+(\w+))?")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let of_user = caps.get(1).map(|m| m.as_str().to_string());
+            Ok(CqlStatement::ListRoles { of_user })
+        } else {
+            Ok(CqlStatement::ListRoles { of_user: None })
+        }
+    }
+    
+    /// LIST PERMISSIONS [OF role] [ON resource]
+    fn parse_list_permissions(query: &str) -> Result<CqlStatement> {
+        let of_role = if let Some(caps) = regex::Regex::new(r"(?i)OF\s+(\w+)")?.captures(query) {
+            Some(caps.get(1).unwrap().as_str().to_string())
+        } else {
+            None
+        };
+        
+        let on_resource = if let Some(caps) = regex::Regex::new(r"(?i)ON\s+(.+?)(?:\s*$|\s+OF)")?.captures(query) {
+            Some(Self::parse_resource(caps.get(1).unwrap().as_str())?)
+        } else {
+            None
+        };
+        
+        Ok(CqlStatement::ListPermissions { of_role, on_resource })
+    }
+    
+    fn parse_permission_type(s: &str) -> Result<crate::schema::PermissionType> {
+        use crate::schema::PermissionType;
+        match s.to_uppercase().as_str() {
+            "ALL" => Ok(PermissionType::All),
+            "CREATE" => Ok(PermissionType::Create),
+            "ALTER" => Ok(PermissionType::Alter),
+            "DROP" => Ok(PermissionType::Drop),
+            "SELECT" => Ok(PermissionType::Select),
+            "MODIFY" => Ok(PermissionType::Modify),
+            "AUTHORIZE" => Ok(PermissionType::Authorize),
+            "DESCRIBE" => Ok(PermissionType::Describe),
+            "EXECUTE" => Ok(PermissionType::Execute),
+            _ => Err(CoreDBError::QueryParsingError {
+                message: format!("Unknown permission type: {}", s),
+            }),
+        }
+    }
+    
+    fn parse_resource(s: &str) -> Result<crate::schema::Resource> {
+        use crate::schema::Resource;
+        let s = s.trim();
+        let upper = s.to_uppercase();
+        
+        if upper == "ALL KEYSPACES" {
+            Ok(Resource::AllKeyspaces)
+        } else if upper == "ALL ROLES" {
+            Ok(Resource::AllRoles)
+        } else if upper == "ALL FUNCTIONS" {
+            Ok(Resource::AllFunctions)
+        } else if upper.starts_with("KEYSPACE ") {
+            let ks = s[9..].trim().to_string();
+            Ok(Resource::Keyspace(ks))
+        } else if upper.starts_with("ROLE ") {
+            let role = s[5..].trim().to_string();
+            Ok(Resource::Role(role))
+        } else if upper.starts_with("TABLE ") {
+            // TABLE keyspace.table
+            let table_str = s[6..].trim();
+            if let Some(dot_pos) = table_str.find('.') {
+                let keyspace = table_str[..dot_pos].to_string();
+                let table = table_str[dot_pos+1..].to_string();
+                Ok(Resource::Table { keyspace, table })
+            } else {
+                Err(CoreDBError::QueryParsingError {
+                    message: "Table resource must be in format: TABLE keyspace.table".to_string(),
+                })
+            }
+        } else if s.contains('.') {
+            // keyspace.table format without TABLE prefix
+            let parts: Vec<&str> = s.split('.').collect();
+            if parts.len() == 2 {
+                Ok(Resource::Table {
+                    keyspace: parts[0].trim().to_string(),
+                    table: parts[1].trim().to_string(),
+                })
+            } else {
+                Err(CoreDBError::QueryParsingError {
+                    message: format!("Invalid resource format: {}", s),
+                })
+            }
+        } else {
+            // Assume it's a keyspace name
+            Ok(Resource::Keyspace(s.to_string()))
+        }
+    }
+    
+    // ========================================================================
+    // DESCRIBE Parsing
+    // ========================================================================
+    
+    /// DESCRIBE KEYSPACE name
+    fn parse_describe_keyspace(query: &str) -> Result<CqlStatement> {
+        let re = regex::Regex::new(r"(?i)(?:DESCRIBE|DESC)\s+KEYSPACE\s+(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let name = caps.get(1).unwrap().as_str().to_string();
+            Ok(CqlStatement::DescribeKeyspace { name })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid DESCRIBE KEYSPACE syntax".to_string(),
+            })
+        }
+    }
+    
+    /// DESCRIBE TABLES [keyspace]
+    fn parse_describe_tables(query: &str) -> Result<CqlStatement> {
+        let re = regex::Regex::new(r"(?i)(?:DESCRIBE|DESC)\s+TABLES(?:\s+(\w+))?")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let keyspace = caps.get(1).map(|m| m.as_str().to_string());
+            Ok(CqlStatement::DescribeTables { keyspace })
+        } else {
+            Ok(CqlStatement::DescribeTables { keyspace: None })
+        }
+    }
+    
+    /// DESCRIBE TABLE keyspace.table or DESCRIBE keyspace.table
+    fn parse_describe_table(query: &str) -> Result<CqlStatement> {
+        // Try DESCRIBE TABLE keyspace.table
+        let re = regex::Regex::new(r"(?i)(?:DESCRIBE|DESC)\s+(?:TABLE\s+)?(\w+)\.(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            let keyspace = caps.get(1).unwrap().as_str().to_string();
+            let table = caps.get(2).unwrap().as_str().to_string();
+            Ok(CqlStatement::DescribeTable { keyspace, table })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid DESCRIBE TABLE syntax. Expected: DESCRIBE [TABLE] keyspace.table".to_string(),
+            })
         }
     }
 }

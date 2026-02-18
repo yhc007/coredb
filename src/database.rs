@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use crate::schema::{TableSchema, KeyspaceDefinition, ReplicationStrategy, PartitionKey, CassandraValue};
+use crate::schema::{TableSchema, KeyspaceDefinition, ReplicationStrategy, PartitionKey, CassandraValue, ColumnDefinition};
 use crate::storage::{Memtable, SSTable, BlockCache, CacheConfig, CacheKey, IndexManager, IndexDefinition};
 use crate::wal::{CommitLog, Mutation};
 use crate::query::{QueryEngine, CqlStatement, QueryResult};
+use crate::query::result::Row as ResultRow;
 use crate::compaction::{CompactionManager, CompactionConfig};
 use crate::persistence::backup::{BackupManager, FullBackup, KeyspaceBackup, TableBackup, TableSchemaBackup, ColumnBackup, RowBackup, IndexBackup, BackupFormat, BackupInfo};
 use crate::error::*;
@@ -71,6 +72,10 @@ pub struct CoreDB {
     pub block_cache: Arc<BlockCache>,
     /// Secondary Index Manager
     pub index_manager: Arc<IndexManager>,
+    /// Users (Authentication)
+    pub users: Arc<RwLock<HashMap<String, crate::schema::User>>>,
+    /// Roles (Authorization)
+    pub roles: Arc<RwLock<HashMap<String, crate::schema::Role>>>,
 }
 
 impl CoreDB {
@@ -108,6 +113,10 @@ impl CoreDB {
         // Index Manager 초기화
         let index_manager = Arc::new(IndexManager::new());
         
+        // Users 및 Roles 초기화
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let roles = Arc::new(RwLock::new(HashMap::new()));
+        
         let mut db = Self {
             keyspaces,
             commit_log: Arc::new(RwLock::new(commit_log)),
@@ -116,6 +125,8 @@ impl CoreDB {
             compaction_manager: Arc::new(compaction_manager),
             block_cache,
             index_manager,
+            users,
+            roles,
         };
         
         // 시스템 키스페이스 초기화
@@ -241,6 +252,54 @@ impl CoreDB {
         // DROP INDEX 처리
         if let CqlStatement::DropIndex { keyspace, name } = &parsed {
             return self.handle_drop_index(keyspace, name).await;
+        }
+        
+        // Authentication & Authorization 처리
+        match &parsed {
+            CqlStatement::CreateUser { name, password, is_superuser, if_not_exists } => {
+                return self.handle_create_user(name, password, *is_superuser, *if_not_exists).await;
+            }
+            CqlStatement::AlterUser { name, password, is_superuser } => {
+                return self.handle_alter_user(name, password.clone(), *is_superuser).await;
+            }
+            CqlStatement::DropUser { name, if_exists } => {
+                return self.handle_drop_user(name, *if_exists).await;
+            }
+            CqlStatement::ListUsers => {
+                return self.handle_list_users().await;
+            }
+            CqlStatement::CreateRole { name, is_superuser, can_login, password, if_not_exists } => {
+                return self.handle_create_role(name, *is_superuser, *can_login, password.clone(), *if_not_exists).await;
+            }
+            CqlStatement::DropRole { name, if_exists } => {
+                return self.handle_drop_role(name, *if_exists).await;
+            }
+            CqlStatement::Grant { permission, resource, to_role } => {
+                return self.handle_grant(permission.clone(), resource.clone(), to_role).await;
+            }
+            CqlStatement::Revoke { permission, resource, from_role } => {
+                return self.handle_revoke(permission.clone(), resource.clone(), from_role).await;
+            }
+            CqlStatement::ListRoles { of_user } => {
+                return self.handle_list_roles(of_user.clone()).await;
+            }
+            CqlStatement::ListPermissions { of_role, on_resource } => {
+                return self.handle_list_permissions(of_role.clone(), on_resource.clone()).await;
+            }
+            // DESCRIBE 처리
+            CqlStatement::DescribeKeyspaces => {
+                return self.handle_describe_keyspaces().await;
+            }
+            CqlStatement::DescribeKeyspace { name } => {
+                return self.handle_describe_keyspace(name).await;
+            }
+            CqlStatement::DescribeTables { keyspace } => {
+                return self.handle_describe_tables(keyspace.clone()).await;
+            }
+            CqlStatement::DescribeTable { keyspace, table } => {
+                return self.handle_describe_table(keyspace, table).await;
+            }
+            _ => {}
         }
         
         // CREATE TABLE인 경우 스키마 저장 정보 추출
@@ -1039,6 +1098,387 @@ impl CoreDB {
         }
         
         Ok(())
+    }
+    
+    // ========================================================================
+    // Authentication & Authorization Handlers
+    // ========================================================================
+    
+    /// CREATE USER 처리
+    async fn handle_create_user(&self, name: &str, password: &str, is_superuser: bool, if_not_exists: bool) -> Result<QueryResult> {
+        use sha2::{Sha256, Digest};
+        
+        let mut users = self.users.write().await;
+        
+        if users.contains_key(name) {
+            if if_not_exists {
+                return Ok(QueryResult::Success);
+            }
+            return Err(CoreDBError::InvalidSchema {
+                message: format!("User '{}' already exists", name),
+            });
+        }
+        
+        // Hash password
+        let mut hasher = Sha256::new();
+        hasher.update(password.as_bytes());
+        let password_hash = format!("{:x}", hasher.finalize());
+        
+        let user = crate::schema::User::new(name.to_string(), password_hash, is_superuser);
+        users.insert(name.to_string(), user);
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// ALTER USER 처리
+    async fn handle_alter_user(&self, name: &str, password: Option<String>, is_superuser: Option<bool>) -> Result<QueryResult> {
+        use sha2::{Sha256, Digest};
+        
+        let mut users = self.users.write().await;
+        
+        let user = users.get_mut(name).ok_or_else(|| CoreDBError::InvalidSchema {
+            message: format!("User '{}' not found", name),
+        })?;
+        
+        if let Some(pwd) = password {
+            let mut hasher = Sha256::new();
+            hasher.update(pwd.as_bytes());
+            user.password_hash = format!("{:x}", hasher.finalize());
+        }
+        
+        if let Some(superuser) = is_superuser {
+            user.is_superuser = superuser;
+        }
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// DROP USER 처리
+    async fn handle_drop_user(&self, name: &str, if_exists: bool) -> Result<QueryResult> {
+        let mut users = self.users.write().await;
+        
+        if users.remove(name).is_none() {
+            if if_exists {
+                return Ok(QueryResult::Success);
+            }
+            return Err(CoreDBError::InvalidSchema {
+                message: format!("User '{}' not found", name),
+            });
+        }
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// LIST USERS 처리
+    async fn handle_list_users(&self) -> Result<QueryResult> {
+        let users = self.users.read().await;
+        
+        let mut rows = Vec::new();
+        for (name, user) in users.iter() {
+            let row = ResultRow::new()
+                .with_column("name".to_string(), CassandraValue::Text(name.clone()))
+                .with_column("super".to_string(), CassandraValue::Boolean(user.is_superuser));
+            rows.push(row);
+        }
+        
+        Ok(QueryResult::Rows(rows))
+    }
+    
+    /// CREATE ROLE 처리
+    async fn handle_create_role(&self, name: &str, is_superuser: bool, can_login: bool, password: Option<String>, if_not_exists: bool) -> Result<QueryResult> {
+        let mut roles = self.roles.write().await;
+        
+        if roles.contains_key(name) {
+            if if_not_exists {
+                return Ok(QueryResult::Success);
+            }
+            return Err(CoreDBError::InvalidSchema {
+                message: format!("Role '{}' already exists", name),
+            });
+        }
+        
+        let role = crate::schema::Role {
+            name: name.to_string(),
+            is_superuser,
+            can_login,
+            permissions: vec![],
+        };
+        
+        roles.insert(name.to_string(), role);
+        
+        // If password provided, also create a user
+        if let Some(pwd) = password {
+            if can_login {
+                drop(roles); // Release lock before calling another handler
+                self.handle_create_user(name, &pwd, is_superuser, true).await?;
+            }
+        }
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// DROP ROLE 처리
+    async fn handle_drop_role(&self, name: &str, if_exists: bool) -> Result<QueryResult> {
+        let mut roles = self.roles.write().await;
+        
+        if roles.remove(name).is_none() {
+            if if_exists {
+                return Ok(QueryResult::Success);
+            }
+            return Err(CoreDBError::InvalidSchema {
+                message: format!("Role '{}' not found", name),
+            });
+        }
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// GRANT 처리
+    async fn handle_grant(&self, permission_type: crate::schema::PermissionType, resource: crate::schema::Resource, to_role: &str) -> Result<QueryResult> {
+        let mut roles = self.roles.write().await;
+        
+        let role = roles.get_mut(to_role).ok_or_else(|| CoreDBError::InvalidSchema {
+            message: format!("Role '{}' not found", to_role),
+        })?;
+        
+        let permission = crate::schema::Permission {
+            permission_type,
+            resource,
+        };
+        
+        if !role.permissions.contains(&permission) {
+            role.permissions.push(permission);
+        }
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// REVOKE 처리
+    async fn handle_revoke(&self, permission_type: crate::schema::PermissionType, resource: crate::schema::Resource, from_role: &str) -> Result<QueryResult> {
+        let mut roles = self.roles.write().await;
+        
+        let role = roles.get_mut(from_role).ok_or_else(|| CoreDBError::InvalidSchema {
+            message: format!("Role '{}' not found", from_role),
+        })?;
+        
+        let permission = crate::schema::Permission {
+            permission_type,
+            resource,
+        };
+        
+        role.permissions.retain(|p| p != &permission);
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// LIST ROLES 처리
+    async fn handle_list_roles(&self, of_user: Option<String>) -> Result<QueryResult> {
+        let roles = self.roles.read().await;
+        let users = self.users.read().await;
+        
+        let mut rows = Vec::new();
+        
+        if let Some(user_name) = of_user {
+            // List roles of specific user
+            if let Some(user) = users.get(&user_name) {
+                for role_name in &user.roles {
+                    if let Some(role) = roles.get(role_name) {
+                        let row = ResultRow::new()
+                            .with_column("role".to_string(), CassandraValue::Text(role.name.clone()))
+                            .with_column("super".to_string(), CassandraValue::Boolean(role.is_superuser));
+                        rows.push(row);
+                    }
+                }
+            }
+        } else {
+            // List all roles
+            for (name, role) in roles.iter() {
+                let row = ResultRow::new()
+                    .with_column("role".to_string(), CassandraValue::Text(name.clone()))
+                    .with_column("super".to_string(), CassandraValue::Boolean(role.is_superuser))
+                    .with_column("login".to_string(), CassandraValue::Boolean(role.can_login));
+                rows.push(row);
+            }
+        }
+        
+        Ok(QueryResult::Rows(rows))
+    }
+    
+    /// LIST PERMISSIONS 처리
+    async fn handle_list_permissions(&self, of_role: Option<String>, _on_resource: Option<crate::schema::Resource>) -> Result<QueryResult> {
+        let roles = self.roles.read().await;
+        
+        let mut rows = Vec::new();
+        
+        let roles_to_check: Vec<&crate::schema::Role> = if let Some(role_name) = of_role {
+            if let Some(role) = roles.get(&role_name) {
+                vec![role]
+            } else {
+                vec![]
+            }
+        } else {
+            roles.values().collect()
+        };
+        
+        for role in roles_to_check {
+            for perm in &role.permissions {
+                let row = ResultRow::new()
+                    .with_column("role".to_string(), CassandraValue::Text(role.name.clone()))
+                    .with_column("permission".to_string(), CassandraValue::Text(format!("{:?}", perm.permission_type)))
+                    .with_column("resource".to_string(), CassandraValue::Text(format!("{:?}", perm.resource)));
+                rows.push(row);
+            }
+        }
+        
+        Ok(QueryResult::Rows(rows))
+    }
+    
+    // ========================================================================
+    // DESCRIBE Handlers
+    // ========================================================================
+    
+    /// DESCRIBE KEYSPACES 처리
+    async fn handle_describe_keyspaces(&self) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let mut rows = Vec::new();
+        for (name, ks) in keyspaces.iter() {
+            let tables = ks.tables.read().await;
+            let row = ResultRow::new()
+                .with_column("keyspace_name".to_string(), CassandraValue::Text(name.clone()))
+                .with_column("tables".to_string(), CassandraValue::Int(tables.len() as i32));
+            rows.push(row);
+        }
+        
+        Ok(QueryResult::Rows(rows))
+    }
+    
+    /// DESCRIBE KEYSPACE 처리
+    async fn handle_describe_keyspace(&self, name: &str) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(name).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: name.to_string(),
+        })?;
+        
+        let tables = ks.tables.read().await;
+        let udts = ks.user_types.read().await;
+        let mvs = ks.materialized_views.read().await;
+        
+        let mut rows = Vec::new();
+        
+        // Keyspace info
+        rows.push(ResultRow::new()
+            .with_column("type".to_string(), CassandraValue::Text("keyspace".to_string()))
+            .with_column("name".to_string(), CassandraValue::Text(name.to_string()))
+            .with_column("replication_factor".to_string(), CassandraValue::Int(ks.definition.replication_factor as i32)));
+        
+        // Tables
+        for (table_name, table) in tables.iter() {
+            let col_count = table.schema.partition_key.len() + table.schema.clustering_key.len() + table.schema.regular_columns.len();
+            rows.push(ResultRow::new()
+                .with_column("type".to_string(), CassandraValue::Text("table".to_string()))
+                .with_column("name".to_string(), CassandraValue::Text(table_name.clone()))
+                .with_column("columns".to_string(), CassandraValue::Int(col_count as i32)));
+        }
+        
+        // UDTs
+        for (udt_name, _) in udts.iter() {
+            rows.push(ResultRow::new()
+                .with_column("type".to_string(), CassandraValue::Text("type".to_string()))
+                .with_column("name".to_string(), CassandraValue::Text(udt_name.clone())));
+        }
+        
+        // Materialized Views
+        for (mv_name, _) in mvs.iter() {
+            rows.push(ResultRow::new()
+                .with_column("type".to_string(), CassandraValue::Text("materialized_view".to_string()))
+                .with_column("name".to_string(), CassandraValue::Text(mv_name.clone())));
+        }
+        
+        Ok(QueryResult::Rows(rows))
+    }
+    
+    /// DESCRIBE TABLES 처리
+    async fn handle_describe_tables(&self, keyspace: Option<String>) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let mut rows = Vec::new();
+        
+        let ks_list: Vec<(&String, &Keyspace)> = if let Some(ref ks_name) = keyspace {
+            if let Some(ks) = keyspaces.get(ks_name) {
+                vec![(ks_name, ks)]
+            } else {
+                return Err(CoreDBError::KeyspaceNotFound {
+                    keyspace: ks_name.clone(),
+                });
+            }
+        } else {
+            keyspaces.iter().collect()
+        };
+        
+        for (ks_name, ks) in ks_list {
+            let tables = ks.tables.read().await;
+            for (table_name, _) in tables.iter() {
+                rows.push(ResultRow::new()
+                    .with_column("keyspace_name".to_string(), CassandraValue::Text(ks_name.clone()))
+                    .with_column("table_name".to_string(), CassandraValue::Text(table_name.clone())));
+            }
+        }
+        
+        Ok(QueryResult::Rows(rows))
+    }
+    
+    /// DESCRIBE TABLE 처리
+    async fn handle_describe_table(&self, keyspace: &str, table: &str) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.to_string(),
+        })?;
+        
+        let tables = ks.tables.read().await;
+        let tbl = tables.get(table).ok_or_else(|| CoreDBError::TableNotFound {
+            table: format!("{}.{}", keyspace, table),
+        })?;
+        
+        let mut rows = Vec::new();
+        
+        // Table info
+        rows.push(ResultRow::new()
+            .with_column("type".to_string(), CassandraValue::Text("table".to_string()))
+            .with_column("keyspace".to_string(), CassandraValue::Text(keyspace.to_string()))
+            .with_column("name".to_string(), CassandraValue::Text(table.to_string())));
+        
+        // Helper to add column rows
+        let add_column = |rows: &mut Vec<ResultRow>, col: &ColumnDefinition, kind: &str| {
+            rows.push(ResultRow::new()
+                .with_column("column_name".to_string(), CassandraValue::Text(col.name.clone()))
+                .with_column("type".to_string(), CassandraValue::Text(format!("{:?}", col.data_type)))
+                .with_column("kind".to_string(), CassandraValue::Text(kind.to_string())));
+        };
+        
+        // Partition key columns
+        for col in &tbl.schema.partition_key {
+            add_column(&mut rows, col, "partition_key");
+        }
+        
+        // Clustering key columns
+        for col in &tbl.schema.clustering_key {
+            add_column(&mut rows, col, "clustering");
+        }
+        
+        // Regular columns
+        for col in &tbl.schema.regular_columns {
+            add_column(&mut rows, col, "regular");
+        }
+        
+        // Static columns
+        for col in &tbl.schema.static_columns {
+            add_column(&mut rows, col, "static");
+        }
+        
+        Ok(QueryResult::Rows(rows))
     }
 }
 

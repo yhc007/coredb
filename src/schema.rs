@@ -249,6 +249,131 @@ pub enum ReplicationStrategy {
     SimpleStrategy,
 }
 
+// ============================================================================
+// Authentication & Authorization
+// ============================================================================
+
+/// 사용자 정의
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub name: String,
+    pub password_hash: String,
+    pub is_superuser: bool,
+    pub created_at: i64,
+    pub roles: Vec<String>,
+}
+
+/// 역할 정의
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Role {
+    pub name: String,
+    pub is_superuser: bool,
+    pub can_login: bool,
+    pub permissions: Vec<Permission>,
+}
+
+/// 권한 정의
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Permission {
+    pub permission_type: PermissionType,
+    pub resource: Resource,
+}
+
+/// 권한 타입
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PermissionType {
+    All,
+    Create,
+    Alter,
+    Drop,
+    Select,
+    Modify,  // INSERT, UPDATE, DELETE
+    Authorize,
+    Describe,
+    Execute,
+}
+
+/// 리소스 타입
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Resource {
+    AllKeyspaces,
+    Keyspace(String),
+    Table { keyspace: String, table: String },
+    AllRoles,
+    Role(String),
+    AllFunctions,
+    Function { keyspace: String, name: String },
+}
+
+impl User {
+    pub fn new(name: String, password_hash: String, is_superuser: bool) -> Self {
+        Self {
+            name,
+            password_hash,
+            is_superuser,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            roles: vec![],
+        }
+    }
+    
+    pub fn has_permission(&self, permission: &Permission, roles: &std::collections::HashMap<String, Role>) -> bool {
+        if self.is_superuser {
+            return true;
+        }
+        
+        for role_name in &self.roles {
+            if let Some(role) = roles.get(role_name) {
+                if role.is_superuser {
+                    return true;
+                }
+                for perm in &role.permissions {
+                    if perm.matches(permission) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+}
+
+impl Permission {
+    pub fn matches(&self, other: &Permission) -> bool {
+        // ALL permission matches everything
+        if self.permission_type == PermissionType::All {
+            return self.resource.contains(&other.resource);
+        }
+        
+        // Check permission type match
+        if self.permission_type != other.permission_type {
+            return false;
+        }
+        
+        // Check resource containment
+        self.resource.contains(&other.resource)
+    }
+}
+
+impl Resource {
+    pub fn contains(&self, other: &Resource) -> bool {
+        match (self, other) {
+            (Resource::AllKeyspaces, Resource::Keyspace(_)) => true,
+            (Resource::AllKeyspaces, Resource::Table { .. }) => true,
+            (Resource::AllKeyspaces, Resource::AllKeyspaces) => true,
+            (Resource::Keyspace(ks1), Resource::Keyspace(ks2)) => ks1 == ks2,
+            (Resource::Keyspace(ks1), Resource::Table { keyspace, .. }) => ks1 == keyspace,
+            (Resource::Table { keyspace: ks1, table: t1 }, Resource::Table { keyspace: ks2, table: t2 }) => {
+                ks1 == ks2 && t1 == t2
+            }
+            (Resource::AllRoles, Resource::Role(_)) => true,
+            (Resource::AllRoles, Resource::AllRoles) => true,
+            (Resource::Role(r1), Resource::Role(r2)) => r1 == r2,
+            _ => self == other,
+        }
+    }
+}
+
 impl Default for TableOptions {
     fn default() -> Self {
         Self {

@@ -98,6 +98,18 @@ impl QueryEngine {
             CqlStatement::DropMaterializedView { keyspace, name } => {
                 self.drop_materialized_view(keyspace, name).await
             },
+            // Authentication & Authorization - handled at database level
+            CqlStatement::CreateUser { .. } | CqlStatement::AlterUser { .. } | CqlStatement::DropUser { .. } |
+            CqlStatement::ListUsers | CqlStatement::CreateRole { .. } | CqlStatement::DropRole { .. } |
+            CqlStatement::Grant { .. } | CqlStatement::Revoke { .. } | CqlStatement::ListRoles { .. } |
+            CqlStatement::ListPermissions { .. } => {
+                Ok(QueryResult::Success) // Handled in database.rs
+            },
+            // DESCRIBE - handled at database level
+            CqlStatement::DescribeKeyspaces | CqlStatement::DescribeKeyspace { .. } |
+            CqlStatement::DescribeTables { .. } | CqlStatement::DescribeTable { .. } => {
+                Ok(QueryResult::Success) // Handled in database.rs
+            },
         }
     }
     
