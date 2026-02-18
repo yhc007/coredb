@@ -58,8 +58,8 @@ impl QueryEngine {
             CqlStatement::Select { keyspace, table, columns, where_clause, limit, aggregations, distinct, allow_filtering, order_by, group_by, page_size, paging_state } => {
                 self.select_rows(keyspace, table, columns, where_clause, limit, aggregations, distinct, allow_filtering, order_by, group_by, page_size, paging_state).await
             },
-            CqlStatement::Update { keyspace, table, values, where_clause, if_conditions } => {
-                self.update_row(keyspace, table, values, where_clause, if_conditions).await
+            CqlStatement::Update { keyspace, table, values, counter_updates, where_clause, if_conditions } => {
+                self.update_row(keyspace, table, values, counter_updates, where_clause, if_conditions).await
             },
             CqlStatement::Delete { keyspace, table, where_clause } => {
                 self.delete_row(keyspace, table, where_clause).await
@@ -622,6 +622,28 @@ impl QueryEngine {
         let result_rows: Vec<SchemaRow> = if let Some(ref wc) = where_clause {
             result_rows.into_iter().filter(|row| {
                 for condition in &wc.conditions {
+                    // TOKEN 함수 처리
+                    if condition.is_token {
+                        let token_value = Self::compute_token(&row.partition_key);
+                        let cond_token = match &condition.value {
+                            CassandraValue::BigInt(v) => *v,
+                            CassandraValue::Int(v) => *v as i64,
+                            _ => 0,
+                        };
+                        let token_cond_value = CassandraValue::BigInt(token_value);
+                        let cond_value = CassandraValue::BigInt(cond_token);
+                        let temp_condition = crate::query::parser::Condition {
+                            column: condition.column.clone(),
+                            operator: condition.operator.clone(),
+                            value: cond_value,
+                            is_token: false,
+                        };
+                        if !Self::matches_condition(&token_cond_value, &temp_condition) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    
                     // 해당 컬럼의 값 찾기
                     let value = {
                         // 1. PK에서 찾기
@@ -958,7 +980,7 @@ impl QueryEngine {
         Ok(QueryResult::Rows(result_rows))
     }
     
-    async fn update_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, where_clause: crate::query::parser::WhereClause, if_conditions: Option<Vec<crate::query::parser::Condition>>) -> Result<QueryResult> {
+    async fn update_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, counter_updates: Vec<crate::query::parser::CounterUpdate>, where_clause: crate::query::parser::WhereClause, if_conditions: Option<Vec<crate::query::parser::Condition>>) -> Result<QueryResult> {
         let keyspace_name = if keyspace.is_empty() {
             self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
                 message: "No keyspace selected".to_string(),
@@ -1023,6 +1045,26 @@ impl QueryEngine {
         for (col_name, value) in values {
             cells.insert(col_name, Cell {
                 value,
+                timestamp: now,
+                ttl: None,
+                is_deleted: false,
+            });
+        }
+        
+        // COUNTER 증감 연산
+        for counter_update in counter_updates {
+            let current_value = cells.get(&counter_update.column)
+                .map(|c| match &c.value {
+                    CassandraValue::Counter(v) => *v,
+                    CassandraValue::BigInt(v) => *v,
+                    CassandraValue::Int(v) => *v as i64,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            
+            let new_value = current_value + counter_update.increment;
+            cells.insert(counter_update.column, Cell {
+                value: CassandraValue::Counter(new_value),
                 timestamp: now,
                 ttl: None,
                 is_deleted: false,
@@ -1095,8 +1137,8 @@ impl QueryEngine {
                 CqlStatement::Insert { keyspace, table, values, ttl, if_not_exists } => {
                     self.insert_row(keyspace, table, values, ttl, if_not_exists).await?;
                 },
-                CqlStatement::Update { keyspace, table, values, where_clause, if_conditions } => {
-                    self.update_row(keyspace, table, values, where_clause, if_conditions).await?;
+                CqlStatement::Update { keyspace, table, values, counter_updates, where_clause, if_conditions } => {
+                    self.update_row(keyspace, table, values, counter_updates, where_clause, if_conditions).await?;
                 },
                 CqlStatement::Delete { keyspace, table, where_clause } => {
                     self.delete_row(keyspace, table, where_clause).await?;
@@ -1290,6 +1332,28 @@ impl QueryEngine {
             (CassandraValue::BigInt(a), CassandraValue::Int(b)) => Some(a.cmp(&(*b as i64))),
             _ => None,
         }
+    }
+    
+    /// TOKEN 함수 - 파티션 키의 해시 값 계산
+    fn compute_token(partition_key: &crate::schema::PartitionKey) -> i64 {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        
+        let mut hasher = DefaultHasher::new();
+        for component in &partition_key.components {
+            match component {
+                CassandraValue::Int(v) => v.hash(&mut hasher),
+                CassandraValue::BigInt(v) => v.hash(&mut hasher),
+                CassandraValue::Text(v) => v.hash(&mut hasher),
+                CassandraValue::UUID(v) => v.hash(&mut hasher),
+                CassandraValue::Boolean(v) => v.hash(&mut hasher),
+                CassandraValue::Blob(v) => v.hash(&mut hasher),
+                _ => 0i64.hash(&mut hasher),
+            }
+        }
+        
+        // i64 범위로 변환 (Cassandra token 범위: -2^63 ~ 2^63-1)
+        hasher.finish() as i64
     }
 }
 

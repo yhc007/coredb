@@ -41,6 +41,7 @@ pub enum CqlStatement {
         keyspace: String,
         table: String,
         values: Vec<(String, CassandraValue)>,
+        counter_updates: Vec<CounterUpdate>,  // COUNTER 증감 연산
         where_clause: WhereClause,
         if_conditions: Option<Vec<Condition>>,
     },
@@ -267,6 +268,13 @@ pub enum SortOrder {
 pub struct OrderBy {
     pub column: String,
     pub order: SortOrder,
+}
+
+/// COUNTER 증감 연산
+#[derive(Debug, Clone)]
+pub struct CounterUpdate {
+    pub column: String,
+    pub increment: i64,  // 양수면 증가, 음수면 감소
 }
 
 /// 간단한 CQL 파서 (실제 구현에서는 더 정교한 파서가 필요)
@@ -614,7 +622,7 @@ impl CqlParser {
     }
     
     fn parse_update(query: &str) -> Result<CqlStatement> {
-        // UPDATE keyspace.table SET col1 = val1, col2 = val2 WHERE pk = x [IF condition]
+        // UPDATE keyspace.table SET col1 = val1, col2 = col2 + 1 WHERE pk = x [IF condition]
         let re = regex::Regex::new(r"(?i)UPDATE\s+(\w+)\.(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+?)(?:\s+IF\s+(.+?))?\s*;?\s*$")?;
         
         if let Some(caps) = re.captures(query) {
@@ -624,14 +632,44 @@ impl CqlParser {
             let where_str = caps.get(4).unwrap().as_str();
             let if_str = caps.get(5).map(|m| m.as_str());
             
-            // SET 파싱
+            // SET 파싱 (COUNTER 증감 표현식 지원)
             let mut values = Vec::new();
+            let mut counter_updates = Vec::new();
+            
+            // COUNTER 증감 패턴: col = col + N 또는 col = col - N
+            let counter_re = regex::Regex::new(r"(?i)(\w+)\s*=\s*(\w+)\s*([+-])\s*(\d+)")?;
+            
             for set_part in set_str.split(',') {
-                let parts: Vec<&str> = set_part.split('=').collect();
-                if parts.len() == 2 {
-                    let col = parts[0].trim().to_string();
-                    let val = Self::parse_value(parts[1].trim())?;
-                    values.push((col, val));
+                let set_part = set_part.trim();
+                
+                // COUNTER 증감 표현식 체크
+                if let Some(counter_caps) = counter_re.captures(set_part) {
+                    let col1 = counter_caps.get(1).unwrap().as_str();
+                    let col2 = counter_caps.get(2).unwrap().as_str();
+                    let op = counter_caps.get(3).unwrap().as_str();
+                    let num: i64 = counter_caps.get(4).unwrap().as_str().parse()?;
+                    
+                    // col = col + N 형식인지 확인 (같은 컬럼명)
+                    if col1.to_lowercase() == col2.to_lowercase() {
+                        let increment = if op == "-" { -num } else { num };
+                        counter_updates.push(CounterUpdate { column: col1.to_string(), increment });
+                    } else {
+                        // 다른 컬럼이면 일반 값 할당으로 처리
+                        let parts: Vec<&str> = set_part.splitn(2, '=').collect();
+                        if parts.len() == 2 {
+                            let col = parts[0].trim().to_string();
+                            let val = Self::parse_value(parts[1].trim())?;
+                            values.push((col, val));
+                        }
+                    }
+                } else {
+                    // 일반 값 할당
+                    let parts: Vec<&str> = set_part.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        let col = parts[0].trim().to_string();
+                        let val = Self::parse_value(parts[1].trim())?;
+                        values.push((col, val));
+                    }
                 }
             }
             
@@ -649,6 +687,7 @@ impl CqlParser {
                 keyspace,
                 table,
                 values,
+                counter_updates,
                 where_clause,
                 if_conditions,
             })
