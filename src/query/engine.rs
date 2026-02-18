@@ -4,9 +4,30 @@ use crate::query::{CqlStatement, QueryResult, Row as QueryRow};
 use crate::error::*;
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::database::Keyspace;
 use tokio::sync::RwLock;
+
+/// TTL 만료 여부 체크
+fn is_cell_expired(cell: &Cell) -> bool {
+    if let Some(ttl) = cell.ttl {
+        if ttl == 0 {
+            return false; // TTL 0은 영구 저장
+        }
+        
+        let now_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        
+        let expiry_time = cell.timestamp + (ttl as i64 * 1_000_000); // ttl is in seconds, timestamp is in microseconds
+        
+        now_micros > expiry_time
+    } else {
+        false // No TTL means never expires
+    }
+}
 
 /// 쿼리 엔진
 pub struct QueryEngine {
@@ -31,8 +52,8 @@ impl QueryEngine {
             CqlStatement::CreateTable { keyspace, name, columns, partition_key, clustering_key, options } => {
                 self.create_table(keyspace, name, columns, partition_key, clustering_key, options).await
             },
-            CqlStatement::Insert { keyspace, table, values } => {
-                self.insert_row(keyspace, table, values).await
+            CqlStatement::Insert { keyspace, table, values, ttl } => {
+                self.insert_row(keyspace, table, values, ttl).await
             },
             CqlStatement::Select { keyspace, table, columns, where_clause, limit } => {
                 self.select_rows(keyspace, table, columns, where_clause, limit).await
@@ -51,6 +72,10 @@ impl QueryEngine {
             },
             CqlStatement::Use { keyspace } => {
                 self.use_keyspace(keyspace).await
+            },
+            // CreateIndex and DropIndex are handled at the database level
+            CqlStatement::CreateIndex { .. } | CqlStatement::DropIndex { .. } => {
+                Ok(QueryResult::Success)
             },
         }
     }
@@ -136,7 +161,7 @@ impl QueryEngine {
         Ok(QueryResult::Success)
     }
     
-    async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>) -> Result<QueryResult> {
+    async fn insert_row(&mut self, keyspace: String, table: String, values: Vec<(String, CassandraValue)>, ttl: Option<u32>) -> Result<QueryResult> {
         let keyspace_name = if keyspace.is_empty() {
             self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
                 message: "No keyspace selected".to_string(),
@@ -170,6 +195,8 @@ impl QueryEngine {
             key_columns.insert(col.name.clone());
         }
         
+        let now = chrono::Utc::now().timestamp_micros();
+        
         for (column_name, value) in values {
             // 컬럼 존재 여부 확인
             if table_struct.schema.get_column(&column_name).is_none() {
@@ -182,8 +209,8 @@ impl QueryEngine {
             if !key_columns.contains(&column_name) {
                 let cell = Cell {
                     value,
-                    timestamp: chrono::Utc::now().timestamp_micros(),
-                    ttl: None,
+                    timestamp: now,
+                    ttl,  // TTL 적용
                     is_deleted: false,
                 };
                 cells.insert(column_name, cell);
@@ -194,7 +221,7 @@ impl QueryEngine {
             partition_key,
             clustering_key,
             cells,
-            timestamp: chrono::Utc::now().timestamp_micros(),
+            timestamp: now,
         };
         
         // 메모리 테이블에 추가
@@ -374,8 +401,12 @@ impl QueryEngine {
                 }
             }
             
-            // 3. Regular Columns (Cells)
+            // 3. Regular Columns (Cells) - TTL 만료 체크
             for (col, cell) in &row.cells {
+                // TTL 만료된 셀은 건너뛰기
+                if is_cell_expired(cell) {
+                    continue;
+                }
                 cells.insert(col.clone(), cell.value.clone());
             }
             
@@ -690,6 +721,7 @@ mod tests {
                 ("id".to_string(), CassandraValue::Int(1)),
                 ("name".to_string(), CassandraValue::Text("John".to_string())),
             ],
+            ttl: None,
         };
         
         let result = engine.execute(insert).await.unwrap();

@@ -15,6 +15,8 @@ CoreDB는 Rust로 작성된 단일 노드 Cassandra 스타일의 NoSQL 데이터
 - **🗜️ 압축 지원**: LZ4, Snappy, ZSTD 압축 알고리즘
 - **🌐 HTTP API**: RESTful 인터페이스 제공
 - **💻 대화형 셸**: CQL 쿼리 실행을 위한 CLI 도구
+- **📇 Secondary Index**: 비기본키 컬럼에 대한 인덱스 지원
+- **⏰ TTL (Time-To-Live)**: 자동 데이터 만료 지원
 
 ## 🏗️ 아키텍처
 
@@ -132,6 +134,27 @@ CREATE TABLE demo.users (
 ```cql
 INSERT INTO demo.users (id, name, email, age) VALUES (1, 'John Doe', 'john@example.com', 30);
 INSERT INTO demo.users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.com', 25);
+```
+
+### TTL (Time-To-Live) 사용
+```cql
+-- 1시간(3600초) 후 자동 만료되는 세션 데이터 삽입
+INSERT INTO demo.sessions (id, token) VALUES (1, 'abc123') USING TTL 3600;
+
+-- 24시간 후 만료되는 캐시 데이터
+INSERT INTO demo.cache (key, value) VALUES ('user:1', 'cached_data') USING TTL 86400;
+```
+
+### Secondary Index 사용
+```cql
+-- email 컬럼에 인덱스 생성
+CREATE INDEX idx_email ON demo.users (email);
+
+-- 인덱스를 사용한 조회 (Primary Key가 아닌 컬럼으로 검색)
+SELECT * FROM demo.users WHERE email = 'john@example.com';
+
+-- 인덱스 삭제
+DROP INDEX demo.idx_email;
 ```
 
 ### 데이터 조회

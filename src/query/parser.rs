@@ -20,6 +20,7 @@ pub enum CqlStatement {
         keyspace: String,
         table: String,
         values: Vec<(String, CassandraValue)>,
+        ttl: Option<u32>,
     },
     Select {
         keyspace: String,
@@ -48,6 +49,16 @@ pub enum CqlStatement {
     },
     Use {
         keyspace: String,
+    },
+    CreateIndex {
+        name: Option<String>,
+        keyspace: String,
+        table: String,
+        column: String,
+    },
+    DropIndex {
+        keyspace: String,
+        name: String,
     },
 }
 
@@ -118,6 +129,10 @@ impl CqlParser {
             Self::parse_drop_keyspace(query)
         } else if query.to_uppercase().starts_with("USE") {
             Self::parse_use(query)
+        } else if query.to_uppercase().starts_with("CREATE INDEX") {
+            Self::parse_create_index(query)
+        } else if query.to_uppercase().starts_with("DROP INDEX") {
+            Self::parse_drop_index(query)
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported query type: {}", query),
@@ -202,14 +217,15 @@ impl CqlParser {
     }
     
     fn parse_insert(query: &str) -> Result<CqlStatement> {
-        // 간단한 INSERT 파싱
-        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+)\)\s*$")?;
+        // INSERT 파싱 (USING TTL 지원)
+        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+?)\)(?:\s+USING\s+TTL\s+(\d+))?\s*;?\s*$")?;
         
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
             let table = caps.get(2).unwrap().as_str().to_string();
             let columns_str = caps.get(3).unwrap().as_str();
             let values_str = caps.get(4).unwrap().as_str();
+            let ttl = caps.get(5).map(|m| m.as_str().parse::<u32>().unwrap_or(0));
             
             let columns: Vec<&str> = columns_str.split(',').map(|s| s.trim()).collect();
             let values = Self::split_values_respecting_quotes(values_str);
@@ -230,6 +246,7 @@ impl CqlParser {
                 keyspace,
                 table,
                 values: value_pairs,
+                ttl,
             })
         } else {
             Err(CoreDBError::QueryParsingError {
@@ -374,6 +391,53 @@ impl CqlParser {
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: "Invalid USE syntax".to_string(),
+            })
+        }
+    }
+    
+    fn parse_create_index(query: &str) -> Result<CqlStatement> {
+        // CREATE INDEX [name] ON keyspace.table (column)
+        // CREATE INDEX ON keyspace.table (column)
+        let re_with_name = regex::Regex::new(
+            r"(?i)CREATE\s+INDEX\s+(\w+)\s+ON\s+(\w+)\.(\w+)\s*\(\s*(\w+)\s*\)"
+        )?;
+        let re_without_name = regex::Regex::new(
+            r"(?i)CREATE\s+INDEX\s+ON\s+(\w+)\.(\w+)\s*\(\s*(\w+)\s*\)"
+        )?;
+        
+        if let Some(caps) = re_with_name.captures(query) {
+            Ok(CqlStatement::CreateIndex {
+                name: Some(caps.get(1).unwrap().as_str().to_string()),
+                keyspace: caps.get(2).unwrap().as_str().to_string(),
+                table: caps.get(3).unwrap().as_str().to_string(),
+                column: caps.get(4).unwrap().as_str().to_string(),
+            })
+        } else if let Some(caps) = re_without_name.captures(query) {
+            Ok(CqlStatement::CreateIndex {
+                name: None,
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                table: caps.get(2).unwrap().as_str().to_string(),
+                column: caps.get(3).unwrap().as_str().to_string(),
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid CREATE INDEX syntax. Expected: CREATE INDEX [name] ON keyspace.table (column)".to_string(),
+            })
+        }
+    }
+    
+    fn parse_drop_index(query: &str) -> Result<CqlStatement> {
+        // DROP INDEX keyspace.index_name
+        let re = regex::Regex::new(r"(?i)DROP\s+INDEX\s+(\w+)\.(\w+)")?;
+        
+        if let Some(caps) = re.captures(query) {
+            Ok(CqlStatement::DropIndex {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                name: caps.get(2).unwrap().as_str().to_string(),
+            })
+        } else {
+            Err(CoreDBError::QueryParsingError {
+                message: "Invalid DROP INDEX syntax. Expected: DROP INDEX keyspace.index_name".to_string(),
             })
         }
     }

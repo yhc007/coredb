@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use crate::schema::{TableSchema, KeyspaceDefinition, ReplicationStrategy};
-use crate::storage::{Memtable, SSTable, BlockCache, CacheConfig, CacheKey};
+use crate::schema::{TableSchema, KeyspaceDefinition, ReplicationStrategy, PartitionKey, CassandraValue};
+use crate::storage::{Memtable, SSTable, BlockCache, CacheConfig, CacheKey, IndexManager, IndexDefinition};
 use crate::wal::{CommitLog, Mutation};
 use crate::query::{QueryEngine, CqlStatement, QueryResult};
 use crate::compaction::{CompactionManager, CompactionConfig};
@@ -65,6 +66,8 @@ pub struct CoreDB {
     pub compaction_manager: Arc<CompactionManager>,
     /// Block Cache (읽기 성능 최적화)
     pub block_cache: Arc<BlockCache>,
+    /// Secondary Index Manager
+    pub index_manager: Arc<IndexManager>,
 }
 
 impl CoreDB {
@@ -99,6 +102,9 @@ impl CoreDB {
         };
         let block_cache = Arc::new(BlockCache::new(cache_config));
         
+        // Index Manager 초기화
+        let index_manager = Arc::new(IndexManager::new());
+        
         let mut db = Self {
             keyspaces,
             commit_log: Arc::new(RwLock::new(commit_log)),
@@ -106,6 +112,7 @@ impl CoreDB {
             config,
             compaction_manager: Arc::new(compaction_manager),
             block_cache,
+            index_manager,
         };
         
         // 시스템 키스페이스 초기화
@@ -223,9 +230,26 @@ impl CoreDB {
     pub async fn execute_cql(&self, query: &str) -> Result<QueryResult> {
         let parsed = crate::query::parser::CqlParser::parse(query)?;
         
+        // CREATE INDEX 처리
+        if let CqlStatement::CreateIndex { name, keyspace, table, column } = &parsed {
+            return self.handle_create_index(name.clone(), keyspace, table, column).await;
+        }
+        
+        // DROP INDEX 처리
+        if let CqlStatement::DropIndex { keyspace, name } = &parsed {
+            return self.handle_drop_index(keyspace, name).await;
+        }
+        
         // CREATE TABLE인 경우 스키마 저장 정보 추출
         let create_table_info = if let CqlStatement::CreateTable { ref keyspace, ref name, ref columns, ref partition_key, ref clustering_key, .. } = parsed {
             Some((keyspace.clone(), name.clone(), columns.clone(), partition_key.clone(), clustering_key.clone()))
+        } else {
+            None
+        };
+        
+        // INSERT 시 인덱스 업데이트 정보 추출
+        let insert_info = if let CqlStatement::Insert { ref keyspace, ref table, ref values, ref ttl } = parsed {
+            Some((keyspace.clone(), table.clone(), values.clone(), *ttl))
         } else {
             None
         };
@@ -273,10 +297,190 @@ impl CoreDB {
             }
         }
         
+        // INSERT 성공 후 인덱스 업데이트
+        if let Some((keyspace, table, values, _ttl)) = insert_info {
+            if matches!(result, QueryResult::Success) {
+                self.update_indexes_on_insert(&keyspace, &table, &values).await;
+            }
+        }
+        
         // 메모리 테이블 플러시 체크
         self.check_memtable_flush().await?;
         
         Ok(result)
+    }
+    
+    /// CREATE INDEX 처리
+    async fn handle_create_index(
+        &self,
+        name: Option<String>,
+        keyspace: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<QueryResult> {
+        // 테이블 존재 확인
+        let keyspaces = self.keyspaces.read().await;
+        let ks = keyspaces.get(keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.to_string(),
+        })?;
+        
+        let tables = ks.tables.read().await;
+        let tbl = tables.get(table).ok_or_else(|| CoreDBError::TableNotFound {
+            table: format!("{}.{}", keyspace, table),
+        })?;
+        
+        // 컬럼 존재 확인
+        if tbl.schema.get_column(column).is_none() {
+            return Err(CoreDBError::InvalidSchema {
+                message: format!("Column '{}' not found in table '{}.{}'", column, keyspace, table),
+            });
+        }
+        
+        // 인덱스 이름 생성
+        let index_name = name.unwrap_or_else(|| format!("{}_{}_idx", table, column));
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        let definition = IndexDefinition {
+            name: index_name.clone(),
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            column: column.to_string(),
+            created_at: now,
+        };
+        
+        // 인덱스 생성
+        self.index_manager.create_index(definition).map_err(|e| {
+            CoreDBError::InvalidSchema { message: e }
+        })?;
+        
+        // 기존 데이터로 인덱스 빌드
+        self.build_index_from_existing_data(keyspace, table, column).await?;
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// DROP INDEX 처리
+    async fn handle_drop_index(&self, keyspace: &str, name: &str) -> Result<QueryResult> {
+        self.index_manager.drop_index(keyspace, name).map_err(|e| {
+            CoreDBError::InvalidSchema { message: e }
+        })?;
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// 기존 데이터로 인덱스 빌드
+    async fn build_index_from_existing_data(
+        &self,
+        keyspace: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<()> {
+        let keyspaces = self.keyspaces.read().await;
+        if let Some(ks) = keyspaces.get(keyspace) {
+            let tables = ks.tables.read().await;
+            if let Some(tbl) = tables.get(table) {
+                // Memtable에서 데이터 읽어서 인덱스 빌드
+                let partitions = tbl.current_memtable.get_all_partitions();
+                for (_, partition) in partitions {
+                    for entry in partition.rows.iter() {
+                        let row = entry.value();
+                        if let Some(cell) = row.cells.get(column) {
+                            self.index_manager.insert_to_index(
+                                keyspace,
+                                table,
+                                column,
+                                cell.value.clone(),
+                                row.partition_key.clone(),
+                            );
+                        }
+                    }
+                }
+                
+                // SSTable에서도 데이터 로드하여 인덱스 빌드
+                for sstable in &tbl.sstables {
+                    for pk in sstable.partition_index.keys() {
+                        if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                            for entry in partition.rows.iter() {
+                                let row = entry.value();
+                                if let Some(cell) = row.cells.get(column) {
+                                    self.index_manager.insert_to_index(
+                                        keyspace,
+                                        table,
+                                        column,
+                                        cell.value.clone(),
+                                        row.partition_key.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// INSERT 후 인덱스 업데이트
+    async fn update_indexes_on_insert(
+        &self,
+        keyspace: &str,
+        table: &str,
+        values: &[(String, CassandraValue)],
+    ) {
+        // 테이블에 정의된 인덱스 확인
+        let indexes = self.index_manager.get_table_indexes(keyspace, table);
+        
+        if indexes.is_empty() {
+            return;
+        }
+        
+        // 파티션 키 추출 (첫 번째 값을 파티션 키로 가정 - 단순화)
+        let pk = if let Some((_, value)) = values.first() {
+            PartitionKey {
+                components: vec![value.clone()],
+            }
+        } else {
+            return;
+        };
+        
+        // 각 인덱스에 대해 업데이트
+        for index_def in indexes {
+            if let Some((_, value)) = values.iter().find(|(col, _)| col == &index_def.column) {
+                self.index_manager.insert_to_index(
+                    keyspace,
+                    table,
+                    &index_def.column,
+                    value.clone(),
+                    pk.clone(),
+                );
+            }
+        }
+    }
+    
+    /// 인덱스를 사용한 쿼리 가능 여부 확인
+    pub fn can_use_index(&self, keyspace: &str, table: &str, column: &str) -> bool {
+        self.index_manager.has_index(keyspace, table, column)
+    }
+    
+    /// 인덱스를 사용한 파티션 키 조회
+    pub fn lookup_by_index(
+        &self,
+        keyspace: &str,
+        table: &str,
+        column: &str,
+        value: &CassandraValue,
+    ) -> Option<Vec<PartitionKey>> {
+        self.index_manager.lookup(keyspace, table, column, value)
+    }
+    
+    /// 모든 인덱스 목록 조회
+    pub fn list_indexes(&self) -> Vec<IndexDefinition> {
+        self.index_manager.list_all_indexes()
     }
     
     /// 키스페이스 생성
@@ -537,7 +741,9 @@ impl CoreDB {
             CqlStatement::CreateKeyspace { .. } |
             CqlStatement::CreateTable { .. } |
             CqlStatement::DropTable { .. } |
-            CqlStatement::DropKeyspace { .. }
+            CqlStatement::DropKeyspace { .. } |
+            CqlStatement::CreateIndex { .. } |
+            CqlStatement::DropIndex { .. }
         )
     }
     
