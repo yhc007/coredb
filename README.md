@@ -17,6 +17,9 @@ CoreDB는 Rust로 작성된 단일 노드 Cassandra 스타일의 NoSQL 데이터
 - **💻 대화형 셸**: CQL 쿼리 실행을 위한 CLI 도구
 - **📇 Secondary Index**: 비기본키 컬럼에 대한 인덱스 지원
 - **⏰ TTL (Time-To-Live)**: 자동 데이터 만료 지원
+- **📊 Aggregations**: COUNT, SUM, AVG, MIN, MAX 지원
+- **📦 BATCH**: 여러 쿼리 일괄 실행
+- **🔒 Lightweight Transactions**: IF NOT EXISTS, IF 조건부 실행
 
 ## 🏗️ 아키텍처
 
@@ -155,6 +158,34 @@ SELECT * FROM demo.users WHERE email = 'john@example.com';
 
 -- 인덱스 삭제
 DROP INDEX demo.idx_email;
+```
+
+### Aggregations (집계 함수)
+```cql
+-- 레코드 수 카운트
+SELECT COUNT(*) FROM demo.users;
+
+-- 숫자 컬럼 집계
+SELECT SUM(age), AVG(age), MIN(age), MAX(age) FROM demo.users;
+```
+
+### BATCH Operations (일괄 처리)
+```cql
+BEGIN BATCH
+    INSERT INTO demo.users (id, name, age) VALUES (1, 'Alice', 25);
+    INSERT INTO demo.users (id, name, age) VALUES (2, 'Bob', 30);
+    UPDATE demo.accounts SET balance = 100 WHERE id = 1;
+APPLY BATCH;
+```
+
+### Lightweight Transactions (조건부 실행)
+```cql
+-- 존재하지 않을 때만 삽입
+INSERT INTO demo.users (id, name) VALUES (1, 'Alice') IF NOT EXISTS;
+
+-- 조건 충족 시에만 업데이트
+UPDATE demo.accounts SET balance = 200 WHERE id = 1 IF balance = 100;
+-- 결과: [applied] = true 또는 false
 ```
 
 ### 데이터 조회
