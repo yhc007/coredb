@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod wal;
 pub mod database;
 pub mod persistence;
+pub mod protocol;
 
 pub use error::*;
 pub use schema::*;
@@ -15,6 +16,7 @@ pub use compaction::*;
 pub use wal::*;
 pub use database::*;
 pub use persistence::*;
+pub use protocol::*;
 
 #[cfg(test)]
 mod tests {
