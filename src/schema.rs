@@ -73,6 +73,18 @@ pub struct TableSchema {
     pub options: TableOptions,
 }
 
+/// Materialized View 정의
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedView {
+    pub name: String,
+    pub keyspace: String,
+    pub base_table: String,
+    pub partition_key: Vec<String>,
+    pub clustering_key: Vec<String>,
+    pub columns: Vec<String>,  // SELECT 컬럼들 ("*" 또는 컬럼 목록)
+    pub where_clause: Option<String>,  // WHERE 조건 (문자열로 저장)
+}
+
 /// Cassandra 값 타입
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CassandraValue {

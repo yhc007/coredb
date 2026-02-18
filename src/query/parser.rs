@@ -95,6 +95,21 @@ pub enum CqlStatement {
         keyspace: String,
         name: String,
     },
+    /// CREATE MATERIALIZED VIEW
+    CreateMaterializedView {
+        keyspace: String,
+        name: String,
+        base_table: String,
+        columns: Vec<String>,
+        partition_key: Vec<String>,
+        clustering_key: Vec<String>,
+        where_clause: Option<String>,
+    },
+    /// DROP MATERIALIZED VIEW
+    DropMaterializedView {
+        keyspace: String,
+        name: String,
+    },
 }
 
 /// ALTER TABLE 연산
@@ -218,6 +233,10 @@ impl CqlParser {
             Self::parse_create_type(query)
         } else if query.to_uppercase().starts_with("DROP TYPE") {
             Self::parse_drop_type(query)
+        } else if query.to_uppercase().starts_with("CREATE MATERIALIZED VIEW") {
+            Self::parse_create_materialized_view(query)
+        } else if query.to_uppercase().starts_with("DROP MATERIALIZED VIEW") {
+            Self::parse_drop_materialized_view(query)
         } else {
             Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported query type: {}", query),
@@ -830,6 +849,86 @@ impl CqlParser {
         
         Err(CoreDBError::QueryParsingError {
             message: "Invalid DROP TYPE syntax. Expected: DROP TYPE ks.name".to_string(),
+        })
+    }
+    
+    fn parse_create_materialized_view(query: &str) -> Result<CqlStatement> {
+        // CREATE MATERIALIZED VIEW ks.view AS SELECT cols FROM ks.table WHERE ... PRIMARY KEY (...)
+        let re = regex::Regex::new(
+            r"(?is)CREATE\s+MATERIALIZED\s+VIEW\s+(\w+)\.(\w+)\s+AS\s+SELECT\s+(.+?)\s+FROM\s+(\w+)\.(\w+)(?:\s+WHERE\s+(.+?))?\s+PRIMARY\s+KEY\s*\(\s*(.+?)\s*\)\s*;?\s*$"
+        )?;
+        
+        if let Some(caps) = re.captures(query) {
+            let keyspace = caps.get(1).unwrap().as_str().to_string();
+            let name = caps.get(2).unwrap().as_str().to_string();
+            let columns_str = caps.get(3).unwrap().as_str();
+            let _base_keyspace = caps.get(4).unwrap().as_str();
+            let base_table = caps.get(5).unwrap().as_str().to_string();
+            let where_clause = caps.get(6).map(|m| m.as_str().to_string());
+            let pk_str = caps.get(7).unwrap().as_str();
+            
+            // SELECT 컬럼 파싱
+            let columns: Vec<String> = columns_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            
+            // PRIMARY KEY 파싱 - ((pk1, pk2), ck1, ck2) 형식
+            let pk_str = pk_str.trim();
+            let mut partition_key = Vec::new();
+            let mut clustering_key = Vec::new();
+            
+            if pk_str.starts_with('(') {
+                // 복합 파티션 키
+                if let Some(end) = pk_str.find(')') {
+                    let pk_part = &pk_str[1..end];
+                    partition_key = pk_part.split(',').map(|s| s.trim().to_string()).collect();
+                    
+                    let rest = &pk_str[end+1..];
+                    if rest.starts_with(',') {
+                        clustering_key = rest[1..].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    }
+                }
+            } else {
+                // 단일 파티션 키
+                let parts: Vec<&str> = pk_str.split(',').collect();
+                if !parts.is_empty() {
+                    partition_key.push(parts[0].trim().to_string());
+                    for p in &parts[1..] {
+                        clustering_key.push(p.trim().to_string());
+                    }
+                }
+            }
+            
+            return Ok(CqlStatement::CreateMaterializedView {
+                keyspace,
+                name,
+                base_table,
+                columns,
+                partition_key,
+                clustering_key,
+                where_clause,
+            });
+        }
+        
+        Err(CoreDBError::QueryParsingError {
+            message: "Invalid CREATE MATERIALIZED VIEW syntax".to_string(),
+        })
+    }
+    
+    fn parse_drop_materialized_view(query: &str) -> Result<CqlStatement> {
+        // DROP MATERIALIZED VIEW keyspace.view
+        let re = regex::Regex::new(r"(?i)DROP\s+MATERIALIZED\s+VIEW\s+(\w+)\.(\w+)\s*;?\s*$")?;
+        
+        if let Some(caps) = re.captures(query) {
+            return Ok(CqlStatement::DropMaterializedView {
+                keyspace: caps.get(1).unwrap().as_str().to_string(),
+                name: caps.get(2).unwrap().as_str().to_string(),
+            });
+        }
+        
+        Err(CoreDBError::QueryParsingError {
+            message: "Invalid DROP MATERIALIZED VIEW syntax".to_string(),
         })
     }
     

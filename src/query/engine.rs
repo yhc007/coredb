@@ -92,6 +92,12 @@ impl QueryEngine {
             CqlStatement::DropType { keyspace, name } => {
                 self.drop_type(keyspace, name).await
             },
+            CqlStatement::CreateMaterializedView { keyspace, name, base_table, columns, partition_key, clustering_key, where_clause } => {
+                self.create_materialized_view(keyspace, name, base_table, columns, partition_key, clustering_key, where_clause).await
+            },
+            CqlStatement::DropMaterializedView { keyspace, name } => {
+                self.drop_materialized_view(keyspace, name).await
+            },
         }
     }
     
@@ -142,6 +148,77 @@ impl QueryEngine {
         }
         
         user_types.remove(&name);
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// CREATE MATERIALIZED VIEW
+    async fn create_materialized_view(
+        &mut self, 
+        keyspace: String, 
+        name: String, 
+        base_table: String,
+        columns: Vec<String>,
+        partition_key: Vec<String>,
+        clustering_key: Vec<String>,
+        where_clause: Option<String>,
+    ) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(&keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.clone(),
+        })?;
+        
+        // 베이스 테이블 존재 확인
+        {
+            let tables = ks.tables.read().await;
+            if !tables.contains_key(&base_table) {
+                return Err(CoreDBError::TableNotFound {
+                    table: base_table.clone(),
+                });
+            }
+        }
+        
+        let mut mvs = ks.materialized_views.write().await;
+        
+        if mvs.contains_key(&name) {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Materialized view '{}' already exists", name),
+            });
+        }
+        
+        let mv = crate::schema::MaterializedView {
+            name: name.clone(),
+            keyspace: keyspace.clone(),
+            base_table,
+            partition_key,
+            clustering_key,
+            columns,
+            where_clause,
+        };
+        
+        mvs.insert(name, mv);
+        
+        Ok(QueryResult::Success)
+    }
+    
+    /// DROP MATERIALIZED VIEW
+    async fn drop_materialized_view(&mut self, keyspace: String, name: String) -> Result<QueryResult> {
+        let keyspaces = self.keyspaces.read().await;
+        
+        let ks = keyspaces.get(&keyspace).ok_or_else(|| CoreDBError::KeyspaceNotFound {
+            keyspace: keyspace.clone(),
+        })?;
+        
+        let mut mvs = ks.materialized_views.write().await;
+        
+        if !mvs.contains_key(&name) {
+            return Err(CoreDBError::QueryExecutionError {
+                message: format!("Materialized view '{}' does not exist", name),
+            });
+        }
+        
+        mvs.remove(&name);
         
         Ok(QueryResult::Success)
     }
@@ -276,6 +353,7 @@ impl QueryEngine {
             },
             tables: Arc::new(RwLock::new(HashMap::new())),
             user_types: Arc::new(RwLock::new(HashMap::new())),
+            materialized_views: Arc::new(RwLock::new(HashMap::new())),
         };
         
         keyspaces.insert(name, keyspace);
