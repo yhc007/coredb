@@ -61,6 +61,9 @@ pub enum CoreDBError {
     
     #[error("Generic error: {message}")]
     Generic { message: String },
+    
+    #[error("Data corruption: {0}")]
+    DataCorruption(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreDBError>;
