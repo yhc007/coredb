@@ -21,6 +21,7 @@ CoreDB는 Rust로 작성된 단일 노드 Cassandra 스타일의 NoSQL 데이터
 - **📦 BATCH**: 여러 쿼리 일괄 실행
 - **🔒 Lightweight Transactions**: IF NOT EXISTS, IF 조건부 실행
 - **💾 백업/복원**: JSON 또는 Binary 포맷으로 전체 DB 백업 및 복원
+- **🔌 Native Protocol v4**: Cassandra 드라이버 100% 호환 (cqlsh, Python, Java, Node.js, Rust)
 
 ## 🏗️ 아키텍처
 
@@ -203,6 +204,28 @@ let backups = db.list_backups("./backups")?;
 // 백업에서 복원
 let result = db.restore_from_backup("./backups/mybackup.json").await?;
 println!("복원: {}개 테이블, {}개 행", result.tables, result.rows);
+```
+
+### Native Protocol 서버 (Cassandra 호환)
+```bash
+# 서버 시작 (포트 9042)
+cargo run --example native_server
+
+# cqlsh로 연결
+cqlsh localhost 9042
+
+# 또는 Cassandra 드라이버 사용
+```
+
+```python
+# Python 예제
+from cassandra.cluster import Cluster
+cluster = Cluster(['localhost'])
+session = cluster.connect()
+session.execute("CREATE KEYSPACE test WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+session.execute("CREATE TABLE test.users (id int PRIMARY KEY, name text)")
+session.execute("INSERT INTO test.users (id, name) VALUES (1, 'Alice')")
+rows = session.execute("SELECT * FROM test.users")
 ```
 
 ### 데이터 조회
