@@ -303,6 +303,10 @@ pub fn encode_value(buf: &mut BytesMut, value: &CassandraValue) {
             write_int(buf, temp.len() as i32);
             buf.extend_from_slice(&temp);
         },
+        CassandraValue::Counter(c) => {
+            write_int(buf, 8);
+            buf.put_i64(*c);
+        },
     }
 }
 

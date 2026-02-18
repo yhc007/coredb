@@ -146,6 +146,10 @@ fn hash_cassandra_value<H: Hasher>(value: &CassandraValue, state: &mut H) {
                 hash_cassandra_value(item, state);
             }
         },
+        CassandraValue::Counter(c) => {
+            state.write_u8(12);
+            c.hash(state);
+        },
     }
 }
 

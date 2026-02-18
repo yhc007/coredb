@@ -1259,6 +1259,7 @@ mod tests {
                     column: "id".to_string(),
                     operator: crate::query::parser::ComparisonOperator::Equal,
                     value: CassandraValue::Int(1),
+                    is_token: false,
                 }],
             }),
             limit: None,

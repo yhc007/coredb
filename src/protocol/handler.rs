@@ -243,6 +243,7 @@ fn encode_cassandra_value(value: &CassandraValue) -> Bytes {
             // 컬렉션 타입은 간단하게 문자열로 변환
             buf.extend_from_slice(format!("{:?}", value).as_bytes());
         },
+        CassandraValue::Counter(c) => buf.extend_from_slice(&c.to_be_bytes()),
     }
     
     buf.freeze()

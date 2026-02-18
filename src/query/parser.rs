@@ -121,6 +121,7 @@ pub struct Condition {
     pub column: String,
     pub operator: ComparisonOperator,
     pub value: CassandraValue,
+    pub is_token: bool,  // TOKEN(col) 형태인 경우 true
 }
 
 /// 비교 연산자
@@ -598,6 +599,33 @@ impl CqlParser {
                 continue;
             }
             
+            // TOKEN() 함수 체크 (TOKEN(col) op value)
+            let token_re = regex::Regex::new(r"(?i)TOKEN\s*\(\s*(\w+)\s*\)\s*(>=|<=|>|<|=)\s*(.+)")?;
+            if let Some(caps) = token_re.captures(part) {
+                let column = caps.get(1).unwrap().as_str().to_string();
+                let op_str = caps.get(2).unwrap().as_str();
+                let value_str = caps.get(3).unwrap().as_str().trim();
+                
+                let operator = match op_str {
+                    ">=" => ComparisonOperator::GreaterThanOrEqual,
+                    "<=" => ComparisonOperator::LessThanOrEqual,
+                    ">" => ComparisonOperator::GreaterThan,
+                    "<" => ComparisonOperator::LessThan,
+                    "=" => ComparisonOperator::Equal,
+                    _ => ComparisonOperator::Equal,
+                };
+                
+                let value = Self::parse_value(value_str)?;
+                
+                conditions.push(Condition {
+                    column,
+                    operator,
+                    value,
+                    is_token: true,
+                });
+                continue;
+            }
+            
             // IN 절 체크 (col IN (val1, val2, ...))
             let in_re = regex::Regex::new(r"(?i)(\w+)\s+IN\s*\(([^)]+)\)")?;
             if let Some(caps) = in_re.captures(part) {
@@ -614,6 +642,7 @@ impl CqlParser {
                     column,
                     operator: ComparisonOperator::In,
                     value: CassandraValue::List(values),
+                    is_token: false,
                 });
                 continue;
             }
@@ -636,7 +665,7 @@ impl CqlParser {
                     let value_str = part[idx + op_str.len()..].trim();
                     let value = Self::parse_value(value_str)?;
                     
-                    conditions.push(Condition { column, operator: op, value });
+                    conditions.push(Condition { column, operator: op, value, is_token: false });
                     matched = true;
                     break;
                 }
@@ -846,6 +875,7 @@ impl CqlParser {
                         column,
                         operator: op,
                         value,
+                        is_token: false,
                     });
                     matched = true;
                     break;
@@ -864,6 +894,7 @@ impl CqlParser {
                         column,
                         operator: ComparisonOperator::Like,
                         value,
+                        is_token: false,
                     });
                     matched = true;
                 }
@@ -882,6 +913,7 @@ impl CqlParser {
                         column,
                         operator: ComparisonOperator::In,
                         value,
+                        is_token: false,
                     });
                     matched = true;
                 }
@@ -945,6 +977,7 @@ impl CqlParser {
             "BOOLEAN" | "BOOL" => Ok(CassandraDataType::Boolean),
             "DOUBLE" | "FLOAT" => Ok(CassandraDataType::Double),
             "BLOB" => Ok(CassandraDataType::Blob),
+            "COUNTER" => Ok(CassandraDataType::Counter),
             _ => Err(CoreDBError::QueryParsingError {
                 message: format!("Unsupported data type: {}", type_str),
             }),

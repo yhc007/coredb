@@ -14,6 +14,7 @@ pub enum CassandraDataType {
     Boolean,
     Double,
     Blob,
+    Counter,  // 분산 카운터 타입
     Map(Box<CassandraDataType>, Box<CassandraDataType>),
     List(Box<CassandraDataType>),
     Set(Box<CassandraDataType>),
@@ -67,6 +68,7 @@ pub enum CassandraValue {
     Boolean(bool),
     Double(f64),
     Blob(Vec<u8>),  // Changed from Bytes to Vec<u8> for serde compatibility
+    Counter(i64),   // 분산 카운터 (증감 연산)
     Null,
     Map(HashMap<String, CassandraValue>),  // HashMap doesn't implement Ord
     List(Vec<CassandraValue>),
@@ -91,6 +93,7 @@ impl PartialOrd for CassandraValue {
             (Boolean(a), Boolean(b)) => a.partial_cmp(b),
             (Double(a), Double(b)) => a.partial_cmp(b),
             (Blob(a), Blob(b)) => a.partial_cmp(b),
+            (Counter(a), Counter(b)) => a.partial_cmp(b),
             (List(a), List(b)) => a.partial_cmp(b),
             (Set(a), Set(b)) => a.partial_cmp(b),
             (Null, Null) => Some(Ordering::Equal),
@@ -118,6 +121,7 @@ impl CassandraValue {
             CassandraValue::Boolean(_) => 1,
             CassandraValue::Double(_) => 8,
             CassandraValue::Blob(b) => 8 + b.len() as u64,
+            CassandraValue::Counter(_) => 8,
             CassandraValue::Null => 1,
             CassandraValue::Map(m) => {
                 let mut size = 8; // length prefix
