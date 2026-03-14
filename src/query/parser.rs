@@ -359,13 +359,13 @@ impl CqlParser {
     }
     
     fn parse_create_keyspace(query: &str) -> Result<CqlStatement> {
-        // 간단한 파싱 - 실제로는 더 정교한 파서가 필요
-        let re = regex::Regex::new(r"CREATE\s+KEYSPACE\s+(\w+)\s+WITH\s+REPLICATION\s*=\s*\{.*'replication_factor'\s*:\s*(\d+).*\}")?;
-        
+        // IF NOT EXISTS 지원
+        let re = regex::Regex::new(r"(?i)CREATE\s+KEYSPACE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+WITH\s+REPLICATION\s*=\s*\{.*'replication_factor'\s*:\s*(\d+).*\}")?;
+
         if let Some(caps) = re.captures(query) {
             let name = caps.get(1).unwrap().as_str().to_string();
             let replication_factor = caps.get(2).unwrap().as_str().parse::<u32>()?;
-            
+
             Ok(CqlStatement::CreateKeyspace {
                 name,
                 options: KeyspaceOptions {
@@ -381,40 +381,71 @@ impl CqlParser {
     }
     
     fn parse_create_table(query: &str) -> Result<CqlStatement> {
-        // 매우 간단한 파싱 - 실제로는 더 정교한 파서가 필요
-        let re = regex::Regex::new(r"(?i)CREATE\s+TABLE\s+(\w+)\.(\w+)\s*\(([\s\S]*)\)")?;
-        
+        // CREATE TABLE keyspace.name (...) 형식 파싱
+        // IF NOT EXISTS 지원, PRIMARY KEY (a, b) 복합 키 지원
+        let re = regex::Regex::new(
+            r"(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)\s*\(([\s\S]*)\)\s*;?\s*$"
+        )?;
+
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
             let name = caps.get(2).unwrap().as_str().to_string();
-            let columns_str = caps.get(3).unwrap().as_str();
-            
-            // 컬럼 파싱 (매우 간단한 버전)
-            let mut columns = Vec::new();
+            let body = caps.get(3).unwrap().as_str();
+
+            // PRIMARY KEY (...) 절을 별도 추출
+            let pk_re = regex::Regex::new(r"(?i)PRIMARY\s+KEY\s*\(([^)]+)\)")?;
             let mut partition_key = Vec::new();
-            let clustering_key = Vec::new();
-            
+            let mut clustering_key = Vec::new();
+
+            // body에서 PRIMARY KEY (...) 절 제거하고 컬럼만 남기기
+            let columns_str = if let Some(pk_caps) = pk_re.captures(body) {
+                let pk_str = pk_caps.get(1).unwrap().as_str();
+                let pk_cols: Vec<&str> = pk_str.split(',').map(|s| s.trim()).collect();
+                if !pk_cols.is_empty() {
+                    partition_key.push(pk_cols[0].to_string());
+                }
+                for col in pk_cols.iter().skip(1) {
+                    clustering_key.push(col.to_string());
+                }
+                // PRIMARY KEY (...) 부분을 통째로 제거
+                let full_match = pk_caps.get(0).unwrap();
+                let before = &body[..full_match.start()];
+                let after = &body[full_match.end()..];
+                format!("{}{}", before, after)
+            } else {
+                body.to_string()
+            };
+
+            // 컬럼 파싱
+            let mut columns = Vec::new();
+
             for column_def in columns_str.split(',') {
-                let parts: Vec<&str> = column_def.trim().split_whitespace().collect();
+                let trimmed = column_def.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let column_name = parts[0].to_string();
+
+                    // 인라인 PRIMARY KEY 처리 (col_name TYPE PRIMARY KEY)
+                    let is_inline_pk = parts.contains(&"PRIMARY") && parts.contains(&"KEY");
+
                     let data_type = Self::parse_data_type(parts[1])?;
-                    
-                    let is_static = parts.contains(&"STATIC");
-                    let is_partition_key = parts.contains(&"PRIMARY") || parts.contains(&"KEY");
-                    
+                    let is_static = parts.iter().any(|p| p.eq_ignore_ascii_case("STATIC"));
+
                     columns.push(ColumnDefinition {
                         name: column_name.clone(),
                         data_type,
                         is_static,
                     });
-                    
-                    if is_partition_key {
+
+                    if is_inline_pk && partition_key.is_empty() {
                         partition_key.push(column_name);
                     }
                 }
             }
-            
+
             Ok(CqlStatement::CreateTable {
                 keyspace,
                 name,

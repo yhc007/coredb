@@ -1330,6 +1330,10 @@ impl QueryEngine {
             (CassandraValue::Timestamp(a), CassandraValue::Timestamp(b)) => Some(a.cmp(b)),
             (CassandraValue::Int(a), CassandraValue::BigInt(b)) => Some((*a as i64).cmp(b)),
             (CassandraValue::BigInt(a), CassandraValue::Int(b)) => Some(a.cmp(&(*b as i64))),
+            (CassandraValue::Int(a), CassandraValue::Double(b)) => (*a as f64).partial_cmp(b),
+            (CassandraValue::Double(a), CassandraValue::Int(b)) => a.partial_cmp(&(*b as f64)),
+            (CassandraValue::BigInt(a), CassandraValue::Double(b)) => (*a as f64).partial_cmp(b),
+            (CassandraValue::Double(a), CassandraValue::BigInt(b)) => a.partial_cmp(&(*b as f64)),
             _ => None,
         }
     }

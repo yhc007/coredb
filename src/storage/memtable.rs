@@ -79,16 +79,42 @@ impl Memtable {
             .map(|entry| entry.value().clone())
     }
     
-    pub fn range_scan(&self, 
+    pub fn range_scan(&self,
         partition_key: &PartitionKey,
         start_clustering: &Option<ClusteringKey>,
         end_clustering: &Option<ClusteringKey>
     ) -> Vec<Row> {
         if let Some(partition) = self.partitions.get(partition_key) {
-            partition.value().rows
-                .range(start_clustering..=end_clustering)
-                .map(|entry| entry.value().clone())
-                .collect()
+            match (start_clustering, end_clustering) {
+                (None, None) => {
+                    // No bounds specified → return ALL rows in partition
+                    partition.value().rows.iter()
+                        .map(|entry| entry.value().clone())
+                        .collect()
+                }
+                (Some(start), Some(end)) => {
+                    let start_key = Some(start.clone());
+                    let end_key = Some(end.clone());
+                    partition.value().rows
+                        .range(start_key..=end_key)
+                        .map(|entry| entry.value().clone())
+                        .collect()
+                }
+                (Some(start), None) => {
+                    let start_key = Some(start.clone());
+                    partition.value().rows
+                        .range(start_key..)
+                        .map(|entry| entry.value().clone())
+                        .collect()
+                }
+                (None, Some(end)) => {
+                    let end_key = Some(end.clone());
+                    partition.value().rows
+                        .range(..=end_key)
+                        .map(|entry| entry.value().clone())
+                        .collect()
+                }
+            }
         } else {
             Vec::new()
         }
