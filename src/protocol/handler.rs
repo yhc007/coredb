@@ -187,13 +187,28 @@ impl RequestHandler {
             QueryResult::Error(msg) => Response::Error(ErrorResponse::invalid(msg)),
             QueryResult::Schema(_) => Response::Result(ResultResponse::Void),
             QueryResult::Rows(rows) => {
-                // 컬럼 정보 추출
+                // Build column specs by walking the values once per column.
+                // The previous version hard-coded col_type = Varchar for every
+                // column, which the scylla driver then attempted to decode as
+                // UTF-8 text — failing on any DOUBLE / INT / TIMESTAMP / UUID
+                // column whose binary payload happens not to be valid UTF-8.
+                // For each column we find the first non-NULL value across the
+                // rowset and derive the matching CqlType. All-NULL columns
+                // (or empty rowsets) fall back to Varchar, which is the
+                // historical behaviour and the safest default for a typeless
+                // payload (empty bytes decode cleanly as the empty string).
                 let columns: Vec<ColumnSpec> = if let Some(first_row) = rows.first() {
-                    first_row.columns.keys().map(|name| ColumnSpec {
-                        keyspace: None,
-                        table: None,
-                        name: name.clone(),
-                        col_type: CqlType::Varchar, // 기본값
+                    first_row.columns.keys().map(|name| {
+                        let col_type = rows
+                            .iter()
+                            .find_map(|r| r.columns.get(name).and_then(cql_type_for_value))
+                            .unwrap_or(CqlType::Varchar);
+                        ColumnSpec {
+                            keyspace: None,
+                            table: None,
+                            name: name.clone(),
+                            col_type,
+                        }
                     }).collect()
                 } else {
                     vec![]
@@ -224,6 +239,37 @@ impl RequestHandler {
             },
         }
     }
+}
+
+/// Map a non-NULL [`CassandraValue`] to the [`CqlType`] code that the
+/// scylla / Cassandra client expects in `RESULT/Rows` metadata.
+///
+/// `None` for [`CassandraValue::Null`] so callers can skip past null
+/// cells when inferring a column's type from sample rows.
+///
+/// Collection variants (List / Set / Map / UDT) are currently serialized
+/// as their Rust `Debug` form — keep them Varchar so the wire-level
+/// payload (UTF-8 text) is consistent with what
+/// [`encode_cassandra_value`] writes for those variants. Once those get
+/// proper structural encoders, switch the mapping to the matching
+/// CqlType::{List, Set, Map, Udt} codes.
+fn cql_type_for_value(value: &CassandraValue) -> Option<CqlType> {
+    Some(match value {
+        CassandraValue::Text(_) => CqlType::Varchar,
+        CassandraValue::Int(_) => CqlType::Int,
+        CassandraValue::BigInt(_) => CqlType::Bigint,
+        CassandraValue::Double(_) => CqlType::Double,
+        CassandraValue::Boolean(_) => CqlType::Boolean,
+        CassandraValue::UUID(_) => CqlType::Uuid,
+        CassandraValue::Timestamp(_) => CqlType::Timestamp,
+        CassandraValue::Blob(_) => CqlType::Blob,
+        CassandraValue::Counter(_) => CqlType::Counter,
+        CassandraValue::List(_)
+        | CassandraValue::Set(_)
+        | CassandraValue::Map(_)
+        | CassandraValue::UDT(_) => CqlType::Varchar,
+        CassandraValue::Null => return None,
+    })
 }
 
 fn encode_cassandra_value(value: &CassandraValue) -> Bytes {

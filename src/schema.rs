@@ -104,6 +104,78 @@ pub enum CassandraValue {
     UDT(HashMap<String, CassandraValue>),  // UDT 필드명 -> 값
 }
 
+impl CassandraValue {
+    /// Reshape this value to match a column's declared
+    /// [`CassandraDataType`]. The CQL parser stores literals using their
+    /// natural form (`123` → `Int`, `1.5` → `Double`, `'abc'` → `Text`,
+    /// `…` UUID-shaped → `UUID`, etc.) without consulting the table
+    /// schema, so a value destined for a TIMESTAMP / BIGINT / DOUBLE
+    /// column needs to be re-tagged before storage. Without this, the
+    /// RESULT/Rows metadata that the native protocol later emits
+    /// reflects the literal's parser-inferred type instead of the
+    /// schema type, and typed clients (scylla, datastax) reject the
+    /// row.
+    ///
+    /// Coercions covered: numeric widen/narrow between Int / BigInt /
+    /// Double / Timestamp / Counter; Text→UUID when the string parses;
+    /// Text→Boolean for the literal forms. Anything else passes
+    /// through unchanged — keep it conservative so we never silently
+    /// drop information.
+    pub fn coerce_to(self, target: &CassandraDataType) -> CassandraValue {
+        use CassandraDataType as T;
+        use CassandraValue::*;
+        match (&self, target) {
+            // Identity — no work to do.
+            (Text(_), T::Text)
+            | (Int(_), T::Int)
+            | (BigInt(_), T::BigInt)
+            | (Double(_), T::Double)
+            | (Boolean(_), T::Boolean)
+            | (UUID(_), T::UUID)
+            | (Timestamp(_), T::Timestamp)
+            | (Blob(_), T::Blob)
+            | (Counter(_), T::Counter)
+            | (Null, _) => self,
+
+            // Numeric reshape across i32 / i64 / f64 / Timestamp / Counter.
+            (Int(n), T::BigInt) => BigInt(*n as i64),
+            (Int(n), T::Double) => Double(*n as f64),
+            (Int(n), T::Timestamp) => Timestamp(*n as i64),
+            (Int(n), T::Counter) => Counter(*n as i64),
+
+            (BigInt(n), T::Int) => Int(*n as i32),
+            (BigInt(n), T::Double) => Double(*n as f64),
+            (BigInt(n), T::Timestamp) => Timestamp(*n),
+            (BigInt(n), T::Counter) => Counter(*n),
+
+            (Double(d), T::Int) => Int(*d as i32),
+            (Double(d), T::BigInt) => BigInt(*d as i64),
+            (Double(d), T::Timestamp) => Timestamp(*d as i64),
+            (Double(d), T::Counter) => Counter(*d as i64),
+
+            // Text → UUID: only when the string actually parses, otherwise
+            // pass the original Text through so the higher layer can report
+            // a schema mismatch with the raw value intact.
+            (Text(s), T::UUID) => match uuid::Uuid::parse_str(s) {
+                Ok(u) => UUID(u),
+                Err(_) => self,
+            },
+
+            // Text → Boolean for the conventional literal forms.
+            (Text(s), T::Boolean) => match s.to_ascii_lowercase().as_str() {
+                "true" => Boolean(true),
+                "false" => Boolean(false),
+                _ => self,
+            },
+
+            // Anything else — keep the original variant so we don't lose
+            // information silently. The storage layer will surface the
+            // mismatch when the value is read back.
+            _ => self,
+        }
+    }
+}
+
 // Custom Eq implementation for CassandraValue
 impl Eq for CassandraValue {}
 

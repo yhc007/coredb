@@ -438,17 +438,36 @@ impl QueryEngine {
         } else {
             keyspace
         };
-        
+
         let keyspaces = self.keyspaces.read().await;
         let keyspace_struct = keyspaces.get(&keyspace_name).ok_or(CoreDBError::QueryExecutionError {
             message: format!("Keyspace '{}' does not exist", keyspace_name),
         })?;
-        
+
         let tables = keyspace_struct.tables.read().await;
         let table_struct = tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
             message: format!("Table '{}' does not exist", table),
         })?;
-        
+
+        // Coerce each parsed literal to its column's schema-declared type
+        // up front. parse_value() is type-agnostic — `42` becomes Int even
+        // when the column is TIMESTAMP, `0.5` becomes Double even when
+        // the column is BigInt, etc. Without this rewrite, the value
+        // stored carries the parser's inference, and later SELECTs emit
+        // RESULT/Rows metadata reflecting that inferred type instead of
+        // the schema type, breaking strongly-typed clients.
+        let mut values = values;
+        for (col_name, val) in values.iter_mut() {
+            if let Some(col_def) = table_struct.schema.get_column(col_name) {
+                let owned = std::mem::replace(val, CassandraValue::Null);
+                *val = owned.coerce_to(&col_def.data_type);
+            } else {
+                return Err(CoreDBError::QueryExecutionError {
+                    message: format!("Column '{}' does not exist in table '{}'", col_name, table),
+                });
+            }
+        }
+
         // 파티션 키와 클러스터링 키 추출
         let (partition_key, clustering_key) = self.extract_keys_from_values(values.clone(), &table_struct.schema)?;
         
@@ -620,8 +639,35 @@ impl QueryEngine {
 
         // WHERE 조건 필터링 (non-PK 조건들)
         let result_rows: Vec<SchemaRow> = if let Some(ref wc) = where_clause {
+            // Pre-coerce each condition's literal to the column's schema
+            // type so comparisons line up. The parser produces literal-
+            // inferred types (`1778716800000` → BigInt) and insert_row
+            // now stores values shaped by the schema type
+            // (bucket_day → Timestamp). Without this step the filter
+            // would compare Timestamp(X) against BigInt(X) and silently
+            // drop every otherwise-matching row.
+            let coerced_conditions: Vec<crate::query::parser::Condition> = wc
+                .conditions
+                .iter()
+                .map(|c| {
+                    let target = table_struct
+                        .schema
+                        .get_column(&c.column)
+                        .map(|cd| cd.data_type.clone());
+                    let value = match target {
+                        Some(t) => c.value.clone().coerce_to(&t),
+                        None => c.value.clone(),
+                    };
+                    crate::query::parser::Condition {
+                        column: c.column.clone(),
+                        operator: c.operator.clone(),
+                        value,
+                        is_token: c.is_token,
+                    }
+                })
+                .collect();
             result_rows.into_iter().filter(|row| {
-                for condition in &wc.conditions {
+                for condition in &coerced_conditions {
                     // TOKEN 함수 처리
                     if condition.is_token {
                         let token_value = Self::compute_token(&row.partition_key);
@@ -1209,22 +1255,29 @@ impl QueryEngine {
     
     fn extract_partition_key(&self, schema: &TableSchema, where_clause: &crate::query::parser::WhereClause) -> Result<Option<PartitionKey>> {
         let mut partition_components = Vec::new();
-        
+
         // WHERE 절에서 파티션 키 컬럼 찾기
         // 간단한 구현: 파티션 키의 첫 번째 컬럼만 확인 (복합 파티션 키 미지원)
+        //
+        // The WHERE literal arrived from the parser with its inferred type
+        // (e.g. `1778630400000` → BigInt). insert_row now coerces stored
+        // values to the column's schema type (Timestamp for that column),
+        // so without the same coercion here the partition lookup compares
+        // BigInt(123) against Timestamp(123) and silently misses every row.
         if let Some(first_pk) = schema.partition_key.first() {
             for condition in &where_clause.conditions {
                 if condition.column == first_pk.name {
-                    partition_components.push(condition.value.clone());
+                    let coerced = condition.value.clone().coerce_to(&first_pk.data_type);
+                    partition_components.push(coerced);
                     break;
                 }
             }
         }
-        
+
         if partition_components.is_empty() {
             return Ok(None);
         }
-        
+
         Ok(Some(PartitionKey {
             components: partition_components,
         }))
