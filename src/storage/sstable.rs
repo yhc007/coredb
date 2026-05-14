@@ -400,12 +400,15 @@ impl SSTable {
     
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
-        // 1. 블룸 필터 체크 (빠른 음성 응답)
-        if !self.bloom_filter.might_contain(partition_key) {
-            return Ok(None);
-        }
-        
-        // 2. 파티션 인덱스에서 오프셋 찾기
+        // Authoritative check: if the in-memory partition_index has the
+        // key, the partition is in this SSTable. The bloom filter used
+        // to be queried first as a fast-negative hint, but the disk
+        // serialization round-trip leaves the loaded filter
+        // false-negativing every key that's actually present, so a
+        // bloom veto here silently dropped every restored partition on
+        // startup. partition_index lookups are O(log n) against a
+        // BTreeMap that's already in memory — the bloom optimization
+        // wasn't pulling its weight anyway.
         let offset = match self.partition_index.get(partition_key) {
             Some(offset) => *offset,
             None => return Ok(None),

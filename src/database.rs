@@ -734,6 +734,39 @@ impl CoreDB {
         Ok(())
     }
     
+    /// Spawn a background task that calls [`Self::flush_all`] on a
+    /// fixed interval, so low-write workloads still hit SSTable
+    /// regularly even when the size-threshold-based flush in
+    /// [`Self::check_memtable_flush`] never trips. Drop the returned
+    /// handle (or let the runtime tear it down) to stop flushing.
+    ///
+    /// Why this is needed: every CQL write currently lands in the
+    /// memtable directly (the engine path bypasses the WAL append in
+    /// [`Self::insert_row`]). Without a periodic flush, a snapshot
+    /// writer like rust-agent's `compare-pnl` produces rows that live
+    /// only in memory until either the 64 MB default threshold trips
+    /// or the process exits cleanly via [`Self::flush_all`]. For the
+    /// few-KB-per-day workloads the agent generates today, neither
+    /// happens on its own, so the data is lost on restart.
+    pub fn spawn_periodic_flush(
+        self: std::sync::Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately; skip it so we don't flush
+            // empty memtables seconds after startup.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(e) = self.flush_all().await {
+                    tracing::warn!("periodic flush failed: {e}");
+                }
+            }
+        })
+    }
+
     /// 모든 메모리 테이블 강제 플러시 (종료 전 호출)
     pub async fn flush_all(&self) -> Result<()> {
         // 먼저 flush할 테이블 목록 수집

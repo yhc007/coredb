@@ -46,17 +46,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     let db = Arc::new(CoreDB::new(config).await?);
-    
+
+    // Background flush every 30 s so the agent's snapshot tables make
+    // it to SSTable without waiting for the 64 MB size threshold.
+    // Combined with the Ctrl+C handler below, this gives us "data
+    // survives a clean restart" — the table-state load on startup
+    // (load_existing_data) already reads from SSTables on disk.
+    let _flush_handle = db
+        .clone()
+        .spawn_periodic_flush(std::time::Duration::from_secs(30));
+
     // 서버 설정
     let server_config = ServerConfig {
         host: "0.0.0.0".to_string(),
         port: 9042,
         max_connections: 1000,
     };
-    
-    // 서버 시작
-    let server = NativeServer::new(db, server_config);
-    server.start().await?;
-    
+
+    // 서버 시작 + Ctrl+C 시 graceful flush
+    let server = NativeServer::new(db.clone(), server_config);
+    tokio::select! {
+        res = server.start() => {
+            res?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n⏎  shutdown signal received; flushing memtables before exit...");
+            if let Err(e) = db.flush_all().await {
+                eprintln!("flush_all failed during shutdown: {e}");
+            } else {
+                println!("✓ memtables flushed.");
+            }
+        }
+    }
+
     Ok(())
 }
