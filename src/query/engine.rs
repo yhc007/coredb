@@ -1192,19 +1192,41 @@ impl QueryEngine {
             cells,
             timestamp: now,
         };
-        
+
+        // WAL append before memtable put — same drop-and-reacquire
+        // pattern as `insert_row` so the commit log captures every
+        // CQL mutation, not just inserts.
+        drop(tables);
+        drop(keyspaces);
+        self.wal_append(
+            &keyspace_name,
+            &table,
+            Mutation::Insert(new_row.clone()),
+        )
+        .await;
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces
+            .get(&keyspace_name)
+            .ok_or(CoreDBError::QueryExecutionError {
+                message: format!("Keyspace '{}' disappeared mid-update", keyspace_name),
+            })?;
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct =
+            tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+                message: format!("Table '{}' disappeared mid-update", table),
+            })?;
         table_struct.current_memtable.put(new_row)?;
-        
+
         // IF 조건이 있었으면 [applied] = true 반환
         if if_conditions.is_some() {
             let mut result_row = HashMap::new();
             result_row.insert("[applied]".to_string(), CassandraValue::Boolean(true));
             return Ok(QueryResult::Rows(vec![QueryRow { columns: result_row }]));
         }
-        
+
         Ok(QueryResult::Success)
     }
-    
+
     async fn delete_row(&mut self, keyspace: String, table: String, where_clause: crate::query::parser::WhereClause) -> Result<QueryResult> {
         let keyspace_name = if keyspace.is_empty() {
             self.current_keyspace.clone().ok_or(CoreDBError::QueryExecutionError {
@@ -1238,9 +1260,34 @@ impl QueryEngine {
             cells: HashMap::new(), // 빈 셀 = 삭제됨
             timestamp: now,
         };
-        
+
+        // WAL append before memtable put. The tombstone row is the
+        // in-memory representation of the delete (empty cells under
+        // the same PK), so logging it as `Mutation::Insert` and
+        // replaying via `memtable.put` reapplies the same tombstone
+        // on startup — semantically equivalent to a structured
+        // Mutation::Delete and avoids touching the replay path.
+        drop(tables);
+        drop(keyspaces);
+        self.wal_append(
+            &keyspace_name,
+            &table,
+            Mutation::Insert(tombstone_row.clone()),
+        )
+        .await;
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces
+            .get(&keyspace_name)
+            .ok_or(CoreDBError::QueryExecutionError {
+                message: format!("Keyspace '{}' disappeared mid-delete", keyspace_name),
+            })?;
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct =
+            tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+                message: format!("Table '{}' disappeared mid-delete", table),
+            })?;
         table_struct.current_memtable.put(tombstone_row)?;
-        
+
         Ok(QueryResult::Success)
     }
     
