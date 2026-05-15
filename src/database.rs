@@ -1953,6 +1953,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// Regression: when the same partition key appears in both the
+    /// memtable AND a flushed SSTable (e.g. an overwrite pattern),
+    /// the COUNT(*) fast path must bail to the slow path so the
+    /// result reflects the dedup'd count, not the naive sum.
+    ///
+    /// Construct the scenario: insert row id=1, flush, then INSERT
+    /// id=1 again (overwrites the SSTable's row in memtable). The
+    /// physical layout has the same partition key in two places.
+    /// COUNT(*) must return 1 (slow-path dedup), not 2 (fast-path
+    /// sum).
+    #[tokio::test]
+    async fn test_count_star_bails_when_partition_overlaps() {
+        use crate::query::QueryResult;
+        use crate::schema::CassandraValue;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_count_overlap_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut config = DatabaseConfig::default();
+        config.data_directory = data_dir.join("data");
+        config.commitlog_directory = data_dir.join("commitlog");
+        let db = CoreDB::new(config).await.unwrap();
+        let ks = format!("test_overlap_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!("CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"))
+            .await
+            .unwrap();
+
+        // First insert + flush — row lands in SSTable.
+        db.execute_cql(&format!(
+            "INSERT INTO {ks}.t (id, name) VALUES (1, 'first')"
+        ))
+        .await
+        .unwrap();
+        db.flush_all().await.ok();
+
+        // Overwrite the same partition key in the new memtable.
+        // After this the (pk=1) partition exists in BOTH the SSTable
+        // and the current memtable.
+        db.execute_cql(&format!(
+            "INSERT INTO {ks}.t (id, name) VALUES (1, 'second')"
+        ))
+        .await
+        .unwrap();
+
+        let result = db
+            .execute_cql(&format!("SELECT COUNT(*) FROM {ks}.t"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        let cell = rows[0].columns.get("count(*)").unwrap();
+        // Fast path would say 2 (memtable=1 + sstable=1); the slow
+        // path dedups (pk=1, ck=None) and returns 1.
+        assert!(
+            matches!(cell, CassandraValue::BigInt(1)),
+            "expected BigInt(1) — slow path must dedup overlap; got {cell:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn test_count_star_fast_path_empty_table() {
         use crate::query::QueryResult;

@@ -654,7 +654,57 @@ impl QueryEngine {
                 .sstables
                 .iter()
                 .all(|s| s.row_count.is_some());
-            if all_have_stats {
+
+            // Overlap guard: if any partition key appears in more
+            // than one of (current memtable ∪ immutable memtables ∪
+            // SSTables), the slow path would dedup by (pk, ck) but
+            // the fast path's naive sum would over-count the
+            // overlap. Bail in that case so overwrite-heavy tables
+            // (e.g. `decisions` whose bucket_day repeats across
+            // flushes) stay correct. Append-only tables with
+            // unique partition keys per flush window (e.g.
+            // `btc_ticks` bucketed by hour) still hit the fast path.
+            //
+            // The check is O(total partitions across the table) —
+            // a HashSet lookup per partition key. Cheap relative to
+            // even one round-trip CoreDB read; we only run it on
+            // the COUNT(*) request which is itself rare.
+            let no_overlap = if all_have_stats {
+                use std::collections::HashSet;
+                let mut seen: HashSet<crate::schema::PartitionKey> = HashSet::new();
+                let mut clean = true;
+                'check: {
+                    let parts = table_struct.current_memtable.get_all_partitions();
+                    for (pk, _) in &parts {
+                        if !seen.insert(pk.clone()) {
+                            clean = false;
+                            break 'check;
+                        }
+                    }
+                    for mt in &table_struct.memtables {
+                        let parts = mt.get_all_partitions();
+                        for (pk, _) in &parts {
+                            if !seen.insert(pk.clone()) {
+                                clean = false;
+                                break 'check;
+                            }
+                        }
+                    }
+                    for s in &table_struct.sstables {
+                        for pk in s.partition_index.keys() {
+                            if !seen.insert(pk.clone()) {
+                                clean = false;
+                                break 'check;
+                            }
+                        }
+                    }
+                }
+                clean
+            } else {
+                false
+            };
+
+            if all_have_stats && no_overlap {
                 let mut total: u64 = table_struct.current_memtable.row_count();
                 for mt in &table_struct.memtables {
                     total += mt.row_count();
