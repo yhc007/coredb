@@ -1688,20 +1688,98 @@ mod tests {
     async fn test_cql_execution() {
         let config = DatabaseConfig::default();
         let db = CoreDB::new(config).await.unwrap();
-        
+
         // Use unique keyspace name to avoid conflicts with parallel tests
         let ks_name = format!("test_ks_{}", std::process::id());
-        
+
         let result = db.execute_cql(&format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}", ks_name)).await.unwrap();
         assert!(result.is_success());
-        
+
         let result = db.execute_cql(&format!("CREATE TABLE {}.test_table (id INT PRIMARY KEY, name TEXT)", ks_name)).await.unwrap();
         assert!(result.is_success());
-        
+
         let result = db.execute_cql(&format!("INSERT INTO {}.test_table (id, name) VALUES (1, 'John')", ks_name)).await.unwrap();
         assert!(result.is_success());
-        
+
         let result = db.execute_cql(&format!("SELECT * FROM {}.test_table WHERE id = 1", ks_name)).await.unwrap();
         assert!(result.is_success());
+    }
+
+    /// Regression: a SELECT projection that includes a column added by
+    /// `ALTER TABLE ... ADD col` must surface that column for every
+    /// returned row — even when *every* row in the response was
+    /// written before the ALTER and therefore has no cell for the
+    /// new column.
+    ///
+    /// Before the engine.rs `select_rows` fix this scenario produced
+    /// a row whose cell map was missing the new column, the
+    /// result-frame builder then couldn't list the column in the
+    /// response metadata, and the scylla driver's typed-row check
+    /// rejected the whole response with "values for columns [...] are
+    /// missing from the DB data but are required by the Rust type".
+    /// The fix synthesizes `CassandraValue::Null` for the absent cell
+    /// so the column slot is always present on the wire.
+    #[tokio::test]
+    async fn test_select_projects_post_alter_column_as_null_for_pre_alter_rows() {
+        use crate::query::QueryResult;
+        use crate::schema::CassandraValue;
+
+        let config = DatabaseConfig::default();
+        let db = CoreDB::new(config).await.unwrap();
+
+        let ks_name = format!("test_alter_null_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks_name} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks_name}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+
+        // Insert a row BEFORE the ALTER. This row's cell map has only
+        // {id, name} — no `strategy` cell exists for it.
+        db.execute_cql(&format!(
+            "INSERT INTO {ks_name}.t (id, name) VALUES (1, 'pre-alter')"
+        ))
+        .await
+        .unwrap();
+
+        // Add a third column. Pre-existing rows are not rewritten —
+        // they simply lack the cell.
+        let alter = db
+            .execute_cql(&format!("ALTER TABLE {ks_name}.t ADD strategy TEXT"))
+            .await
+            .unwrap();
+        assert!(alter.is_success(), "ALTER TABLE ADD failed: {alter:?}");
+
+        // Explicit projection that includes the post-ALTER column.
+        // The pre-ALTER row should come back with `strategy = NULL`
+        // (not missing from the cell map entirely).
+        let result = db
+            .execute_cql(&format!(
+                "SELECT id, name, strategy FROM {ks_name}.t WHERE id = 1"
+            ))
+            .await
+            .unwrap();
+        let rows = match &result {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {rows:?}");
+        let row = &rows[0];
+        assert!(
+            row.columns.contains_key("strategy"),
+            "regression: projected `strategy` column missing from pre-ALTER row's cell map; got keys {:?}",
+            row.columns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(row.columns.get("strategy"), Some(CassandraValue::Null)),
+            "expected NULL for pre-ALTER row's `strategy`, got {:?}",
+            row.columns.get("strategy")
+        );
     }
 }
