@@ -143,6 +143,18 @@ impl Memtable {
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
     }
+
+    /// Total live row count across every partition. Used by the
+    /// engine's `SELECT COUNT(*) FROM ks.t` fast path — sums to one
+    /// scalar without materializing rows. SkipMap::len is O(N) but
+    /// the per-partition row counts are small in practice (clustering
+    /// keys group rows tightly), and we only sum once per scrape.
+    pub fn row_count(&self) -> u64 {
+        self.partitions
+            .iter()
+            .map(|entry| entry.value().rows.len() as u64)
+            .sum()
+    }
     
     pub fn creation_time(&self) -> i64 {
         self.creation_time

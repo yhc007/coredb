@@ -30,6 +30,24 @@ pub struct SSTable {
     pub max_timestamp: i64,
     pub compression: CompressionType,
     pub size_bytes: u64,
+    /// Total row count across every partition in this SSTable.
+    /// Populated at creation time (from memtable or compaction) and
+    /// persisted to a `{id}-Stats.json` side file. Loaded back via
+    /// [`SSTable::open`] when present; `None` for legacy SSTables on
+    /// disk that predate the stats sidecar. A `None` value tells the
+    /// COUNT(*) fast path to fall back to the row-materialization
+    /// slow path for *that* SSTable; new memtable flushes / compactions
+    /// always write the sidecar so the fleet self-heals over time.
+    pub row_count: Option<u64>,
+}
+
+/// Stats sidecar — `{id}-Stats.json` next to `{id}-Data.db`.
+/// Versioned so a future addition (e.g. tombstone count, per-side
+/// counts) doesn't break older readers.
+#[derive(Serialize, Deserialize, Debug)]
+struct SSTableStats {
+    version: u32,
+    row_count: u64,
 }
 
 /// SSTable 헤더
@@ -67,6 +85,7 @@ impl SSTable {
         let mut min_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
         let mut total_size = 0u64;
+        let mut row_count: u64 = 0;
         
         // 헤더 공간 예약 (나중에 업데이트)
         let _header_size = bincode::serialized_size(&SSTableHeader {
@@ -118,29 +137,30 @@ impl SSTable {
             current_offset += partition_size;
             total_size += partition_size;
             
-            // 타임스탬프 범위 업데이트
+            // 타임스탬프 범위 업데이트 + 행 카운트
             for row_entry in partition.rows.iter() {
                 let row = row_entry.value();
                 min_timestamp = min_timestamp.min(row.timestamp);
                 max_timestamp = max_timestamp.max(row.timestamp);
+                row_count += 1;
             }
         }
-        
+
         let bloom_filter_offset = current_offset;
         let bloom_filter_data = bincode::serialize(&bloom_filter)?;
         data_file.write_all(&bloom_filter_data).await?;
         current_offset += bloom_filter_data.len() as u64;
-        
+
         let partition_index_offset = current_offset;
         let partition_index_data = bincode::serialize(&partition_index)?;
         data_file.write_all(&partition_index_data).await?;
         current_offset += partition_index_data.len() as u64;
-        
+
         let summary_index_offset = current_offset;
         let summary_index = Self::build_summary_index(&partition_index);
         let summary_index_data = bincode::serialize(&summary_index)?;
         data_file.write_all(&summary_index_data).await?;
-        
+
         // 헤더 업데이트
         let header = SSTableHeader {
             version: 1,
@@ -152,12 +172,12 @@ impl SSTable {
             partition_index_offset,
             summary_index_offset,
         };
-        
+
         let header_data = bincode::serialize(&header)?;
         data_file.seek(SeekFrom::Start(0)).await?;
         data_file.write_all(&header_data).await?;
         data_file.sync_all().await?;
-        
+
         // partition_index를 별도 JSON 파일로 저장 (안정적인 복구용)
         let index_file_path = base_dir.join(format!("{}-Index.json", sstable_id));
         let index_vec: Vec<(PartitionKey, u64)> = partition_index.iter()
@@ -165,12 +185,23 @@ impl SSTable {
             .collect();
         let index_json = serde_json::to_string(&index_vec)?;
         tokio::fs::write(&index_file_path, index_json).await?;
-        
+
         // Bloom Filter를 별도 파일로 저장
         let bloom_file_path = base_dir.join(format!("{}-Bloom.db", sstable_id));
         let bloom_data = bincode::serialize(&bloom_filter)?;
         tokio::fs::write(&bloom_file_path, bloom_data).await?;
-        
+
+        // Stats sidecar — small JSON file next to the data file. Lets
+        // a future COUNT(*) reuse the row count without rescanning
+        // partitions. Failure to write the sidecar is non-fatal: the
+        // SSTable itself is durable, and a missing sidecar just means
+        // the fast path will skip this file on next load.
+        let stats_file_path = base_dir.join(format!("{}-Stats.json", sstable_id));
+        let stats = SSTableStats { version: 1, row_count };
+        if let Ok(stats_json) = serde_json::to_string(&stats) {
+            tokio::fs::write(&stats_file_path, stats_json).await.ok();
+        }
+
         Ok(SSTable {
             id: sstable_id,
             file_path: data_file_path,
@@ -181,6 +212,7 @@ impl SSTable {
             max_timestamp,
             compression: compression.clone(),
             size_bytes: total_size,
+            row_count: Some(row_count),
         })
     }
     
@@ -204,6 +236,7 @@ impl SSTable {
         let mut min_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
         let mut total_size = 0u64;
+        let mut row_count: u64 = 0;
         
         // 헤더 공간 예약
         let dummy_header = SSTableHeader {
@@ -240,29 +273,30 @@ impl SSTable {
             current_offset += partition_size;
             total_size += partition_size;
             
-            // 타임스탬프 범위 업데이트
+            // 타임스탬프 범위 업데이트 + 행 카운트
             for row_entry in partition.rows.iter() {
                 let row = row_entry.value();
                 min_timestamp = min_timestamp.min(row.timestamp);
                 max_timestamp = max_timestamp.max(row.timestamp);
+                row_count += 1;
             }
         }
-        
+
         let bloom_filter_offset = current_offset;
         let bloom_filter_data = bincode::serialize(&bloom_filter)?;
         data_file.write_all(&bloom_filter_data).await?;
         current_offset += bloom_filter_data.len() as u64;
-        
+
         let partition_index_offset = current_offset;
         let partition_index_data = bincode::serialize(&partition_index)?;
         data_file.write_all(&partition_index_data).await?;
         current_offset += partition_index_data.len() as u64;
-        
+
         let summary_index_offset = current_offset;
         let summary_index = Self::build_summary_index(&partition_index);
         let summary_index_data = bincode::serialize(&summary_index)?;
         data_file.write_all(&summary_index_data).await?;
-        
+
         // 헤더 업데이트
         let header = SSTableHeader {
             version: 1,
@@ -274,12 +308,12 @@ impl SSTable {
             partition_index_offset,
             summary_index_offset,
         };
-        
+
         let header_data = bincode::serialize(&header)?;
         data_file.seek(SeekFrom::Start(0)).await?;
         data_file.write_all(&header_data).await?;
         data_file.sync_all().await?;
-        
+
         // 인덱스 파일 저장
         let index_file_path = base_dir.join(format!("{}-Index.json", sstable_id));
         let index_vec: Vec<(PartitionKey, u64)> = partition_index.iter()
@@ -287,11 +321,18 @@ impl SSTable {
             .collect();
         let index_json = serde_json::to_string(&index_vec)?;
         tokio::fs::write(&index_file_path, index_json).await?;
-        
+
         // Bloom Filter 별도 파일 저장
         let bloom_file_path = base_dir.join(format!("{}-Bloom.db", sstable_id));
         tokio::fs::write(&bloom_file_path, &bloom_filter_data).await?;
-        
+
+        // Stats sidecar (see create_from_memtable for rationale).
+        let stats_file_path = base_dir.join(format!("{}-Stats.json", sstable_id));
+        let stats = SSTableStats { version: 1, row_count };
+        if let Ok(stats_json) = serde_json::to_string(&stats) {
+            tokio::fs::write(&stats_file_path, stats_json).await.ok();
+        }
+
         Ok(SSTable {
             id: sstable_id,
             file_path: data_file_path,
@@ -302,6 +343,7 @@ impl SSTable {
             max_timestamp,
             compression,
             size_bytes: total_size,
+            row_count: Some(row_count),
         })
     }
     
@@ -385,6 +427,23 @@ impl SSTable {
             .map(|s| s.replace("-Data", ""))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         
+        // Stats sidecar — optional. Legacy SSTables on disk won't
+        // have one; their `row_count` stays `None` and the COUNT(*)
+        // fast path falls back to slow-scan for *that* file only,
+        // so a partially-upgraded fleet still works.
+        let stats_file_path = file_path.with_file_name(
+            file_path.file_stem().unwrap().to_string_lossy().replace("-Data", "-Stats") + ".json",
+        );
+        let row_count = if stats_file_path.exists() {
+            tokio::fs::read_to_string(&stats_file_path)
+                .await
+                .ok()
+                .and_then(|s| serde_json::from_str::<SSTableStats>(&s).ok())
+                .map(|s| s.row_count)
+        } else {
+            None
+        };
+
         Ok(SSTable {
             id,
             file_path: file_path.to_path_buf(),
@@ -395,9 +454,10 @@ impl SSTable {
             max_timestamp: header.max_timestamp,
             compression: header.compression,
             size_bytes: metadata.len(),
+            row_count,
         })
     }
-    
+
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
         // Authoritative check: if the in-memory partition_index has the

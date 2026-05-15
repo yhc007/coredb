@@ -633,6 +633,42 @@ impl QueryEngine {
             None
         };
 
+        // Fast path: `SELECT COUNT(*) FROM ks.t` with no WHERE / no
+        // GROUP BY / no DISTINCT. Sums the memtable row count + each
+        // SSTable's persisted row_count (via the `-Stats.json`
+        // sidecar). If *any* SSTable lacks a stats file (legacy data
+        // on disk from before the sidecar landed), fall back to the
+        // slow row-materialization path so the count stays correct.
+        // New compactions / memtable flushes always write the
+        // sidecar, so a busy table self-heals into the fast path
+        // within a flush cycle.
+        let count_star_eligible = where_clause.is_none()
+            && partition_key.is_none()
+            && group_by.is_empty()
+            && !distinct
+            && aggregations.len() == 1
+            && matches!(aggregations[0].func, crate::query::parser::AggregationFunc::Count)
+            && aggregations[0].column == "*";
+        if count_star_eligible {
+            let all_have_stats = table_struct
+                .sstables
+                .iter()
+                .all(|s| s.row_count.is_some());
+            if all_have_stats {
+                let mut total: u64 = table_struct.current_memtable.row_count();
+                for mt in &table_struct.memtables {
+                    total += mt.row_count();
+                }
+                for s in &table_struct.sstables {
+                    total += s.row_count.unwrap_or(0);
+                }
+                let mut cells = HashMap::new();
+                let agg_name = format!("count({})", aggregations[0].column);
+                cells.insert(agg_name, crate::schema::CassandraValue::BigInt(total as i64));
+                return Ok(QueryResult::Rows(vec![QueryRow { columns: cells }]));
+            }
+        }
+
         // Fast path: `SELECT * FROM ks.t LIMIT 1` with no WHERE / no
         // aggregation / no GROUP BY / no DISTINCT / no ORDER BY.
         // Used heavily by `verify_tables` (post-migrate smoke check)

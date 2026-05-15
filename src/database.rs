@@ -1785,6 +1785,85 @@ mod tests {
         }
     }
 
+    /// Regression: `SELECT COUNT(*) FROM ks.t` with no WHERE must
+    /// return the correct count via the engine's fast path, summing
+    /// memtable + SSTable row_count. With no SSTables yet (only
+    /// memtable), the memtable row count alone must drive the answer.
+    #[tokio::test]
+    async fn test_count_star_fast_path_memtable_only() {
+        use crate::query::QueryResult;
+        use crate::schema::CassandraValue;
+
+        let config = DatabaseConfig::default();
+        let db = CoreDB::new(config).await.unwrap();
+
+        let ks = format!("test_count_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+        for i in 0..7 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'row-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        let result = db
+            .execute_cql(&format!("SELECT COUNT(*) FROM {ks}.t"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "COUNT(*) returns exactly 1 row");
+        let cell = rows[0].columns.get("count(*)").expect("count(*) column");
+        assert!(
+            matches!(cell, CassandraValue::BigInt(7)),
+            "expected BigInt(7), got {cell:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_star_fast_path_empty_table() {
+        use crate::query::QueryResult;
+        use crate::schema::CassandraValue;
+
+        let config = DatabaseConfig::default();
+        let db = CoreDB::new(config).await.unwrap();
+        let ks = format!("test_count_empty_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+
+        let result = db
+            .execute_cql(&format!("SELECT COUNT(*) FROM {ks}.t"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        let cell = rows[0].columns.get("count(*)").expect("count(*) column");
+        assert!(matches!(cell, CassandraValue::BigInt(0)), "expected BigInt(0), got {cell:?}");
+    }
+
     /// Regression: a SELECT projection that includes a column added by
     /// `ALTER TABLE ... ADD col` must surface that column for every
     /// returned row — even when *every* row in the response was
