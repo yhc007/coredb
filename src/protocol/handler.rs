@@ -197,21 +197,41 @@ impl RequestHandler {
                 // (or empty rowsets) fall back to Varchar, which is the
                 // historical behaviour and the safest default for a typeless
                 // payload (empty bytes decode cleanly as the empty string).
-                let columns: Vec<ColumnSpec> = if let Some(first_row) = rows.first() {
-                    first_row.columns.keys().map(|name| {
+                //
+                // We can't use `first_row.columns.keys()` as the column
+                // set: rows persisted before an `ALTER TABLE ... ADD col`
+                // simply have no cell for the new column, and if the
+                // first row in the result happens to be one of those,
+                // the new column would silently disappear from every
+                // response — including ones that DID include the column
+                // in the explicit SELECT projection. Take the *union* of
+                // column names across the whole rowset instead so a
+                // single row with the new column is enough to surface
+                // it for every row (the others will encode as NULL).
+                let columns: Vec<ColumnSpec> = if rows.is_empty() {
+                    vec![]
+                } else {
+                    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                    let mut ordered: Vec<String> = Vec::new();
+                    for row in &rows {
+                        for name in row.columns.keys() {
+                            if seen.insert(name.as_str()) {
+                                ordered.push(name.clone());
+                            }
+                        }
+                    }
+                    ordered.into_iter().map(|name| {
                         let col_type = rows
                             .iter()
-                            .find_map(|r| r.columns.get(name).and_then(cql_type_for_value))
+                            .find_map(|r| r.columns.get(&name).and_then(cql_type_for_value))
                             .unwrap_or(CqlType::Varchar);
                         ColumnSpec {
                             keyspace: None,
                             table: None,
-                            name: name.clone(),
+                            name,
                             col_type,
                         }
                     }).collect()
-                } else {
-                    vec![]
                 };
                 
                 let columns_count = columns.len() as i32;
