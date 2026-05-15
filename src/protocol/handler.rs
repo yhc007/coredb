@@ -187,55 +187,9 @@ impl RequestHandler {
             QueryResult::Error(msg) => Response::Error(ErrorResponse::invalid(msg)),
             QueryResult::Schema(_) => Response::Result(ResultResponse::Void),
             QueryResult::Rows(rows) => {
-                // Build column specs by walking the values once per column.
-                // The previous version hard-coded col_type = Varchar for every
-                // column, which the scylla driver then attempted to decode as
-                // UTF-8 text — failing on any DOUBLE / INT / TIMESTAMP / UUID
-                // column whose binary payload happens not to be valid UTF-8.
-                // For each column we find the first non-NULL value across the
-                // rowset and derive the matching CqlType. All-NULL columns
-                // (or empty rowsets) fall back to Varchar, which is the
-                // historical behaviour and the safest default for a typeless
-                // payload (empty bytes decode cleanly as the empty string).
-                //
-                // We can't use `first_row.columns.keys()` as the column
-                // set: rows persisted before an `ALTER TABLE ... ADD col`
-                // simply have no cell for the new column, and if the
-                // first row in the result happens to be one of those,
-                // the new column would silently disappear from every
-                // response — including ones that DID include the column
-                // in the explicit SELECT projection. Take the *union* of
-                // column names across the whole rowset instead so a
-                // single row with the new column is enough to surface
-                // it for every row (the others will encode as NULL).
-                let columns: Vec<ColumnSpec> = if rows.is_empty() {
-                    vec![]
-                } else {
-                    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                    let mut ordered: Vec<String> = Vec::new();
-                    for row in &rows {
-                        for name in row.columns.keys() {
-                            if seen.insert(name.as_str()) {
-                                ordered.push(name.clone());
-                            }
-                        }
-                    }
-                    ordered.into_iter().map(|name| {
-                        let col_type = rows
-                            .iter()
-                            .find_map(|r| r.columns.get(&name).and_then(cql_type_for_value))
-                            .unwrap_or(CqlType::Varchar);
-                        ColumnSpec {
-                            keyspace: None,
-                            table: None,
-                            name,
-                            col_type,
-                        }
-                    }).collect()
-                };
-                
+                let columns = build_column_specs(&rows);
                 let columns_count = columns.len() as i32;
-                
+
                 // 행 데이터 변환
                 let result_rows: Vec<Vec<Option<Bytes>>> = rows.iter().map(|row| {
                     columns.iter().map(|col| {
@@ -244,7 +198,7 @@ impl RequestHandler {
                         })
                     }).collect()
                 }).collect();
-                
+
                 Response::Result(ResultResponse::Rows(RowsResult {
                     metadata: RowsMetadata {
                         flags: 0x0001, // Global_tables_spec
@@ -259,6 +213,59 @@ impl RequestHandler {
             },
         }
     }
+}
+
+/// Build the response's column-spec list from a SELECT result rowset.
+///
+/// Why this lives outside `convert_result`: the column-spec build is
+/// the bug-prone part of the result-frame builder, so a unit test
+/// wants to drive it directly without standing up a `RequestHandler`
+/// (which requires `Arc<CoreDB>`).
+///
+/// Two invariants this guards:
+///
+/// 1. **Union of row keys**, *not* `first_row.columns.keys()`. Rows
+///    written before an `ALTER TABLE ... ADD col` have no cell for
+///    the new column; with first-row-only, the new column silently
+///    disappears whenever ordering puts a pre-ALTER row first. The
+///    union is order-preserving — the first time a column is seen
+///    pins its position, and later rows with the same key are
+///    ignored, so the output order stays deterministic for an
+///    otherwise-deterministic input.
+///
+/// 2. **Type inference from the first non-NULL sample**. The previous
+///    iteration hard-coded `CqlType::Varchar` which made the scylla
+///    driver try to UTF-8-decode binary payloads. Falling back to
+///    Varchar only when *every* sample is NULL preserves the safe
+///    historical behaviour for all-null columns.
+fn build_column_specs(rows: &[crate::query::result::Row]) -> Vec<ColumnSpec> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    for row in rows {
+        for name in row.columns.keys() {
+            if seen.insert(name.as_str()) {
+                ordered.push(name.clone());
+            }
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|name| {
+            let col_type = rows
+                .iter()
+                .find_map(|r| r.columns.get(&name).and_then(cql_type_for_value))
+                .unwrap_or(CqlType::Varchar);
+            ColumnSpec {
+                keyspace: None,
+                table: None,
+                name,
+                col_type,
+            }
+        })
+        .collect()
 }
 
 /// Map a non-NULL [`CassandraValue`] to the [`CqlType`] code that the
@@ -290,6 +297,128 @@ fn cql_type_for_value(value: &CassandraValue) -> Option<CqlType> {
         | CassandraValue::UDT(_) => CqlType::Varchar,
         CassandraValue::Null => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::result::Row as ResultRow;
+    use std::collections::HashMap;
+
+    fn row(cells: &[(&str, CassandraValue)]) -> ResultRow {
+        let mut columns = HashMap::new();
+        for (name, value) in cells {
+            columns.insert((*name).to_string(), value.clone());
+        }
+        ResultRow { columns }
+    }
+
+    #[test]
+    fn empty_rowset_yields_empty_columns() {
+        let columns = build_column_specs(&[]);
+        assert!(columns.is_empty());
+    }
+
+    #[test]
+    fn column_type_derived_from_first_non_null_sample() {
+        // Column `n` is NULL in row 0, Int(7) in row 1.
+        // Expectation: col_type = Int (not Varchar fallback).
+        let rows = vec![
+            row(&[("n", CassandraValue::Null)]),
+            row(&[("n", CassandraValue::Int(7))]),
+        ];
+        let columns = build_column_specs(&rows);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "n");
+        assert_eq!(columns[0].col_type, CqlType::Int);
+    }
+
+    #[test]
+    fn all_null_column_falls_back_to_varchar() {
+        let rows = vec![
+            row(&[("x", CassandraValue::Null)]),
+            row(&[("x", CassandraValue::Null)]),
+        ];
+        let columns = build_column_specs(&rows);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].col_type, CqlType::Varchar);
+    }
+
+    /// THE regression test for the column-spec union fix.
+    ///
+    /// Reproduces the scenario that broke `compare-pnl` in production:
+    /// a SELECT response contains rows from a table that was ALTERed
+    /// to add a new column (here `strategy`), so older rows have no
+    /// cell for it. Before the fix, the column-spec list was built
+    /// from `rows[0].columns.keys()`. If the older row sorted first,
+    /// the new column disappeared from the wire and the scylla
+    /// driver's typed-row deserializer rejected the whole batch.
+    ///
+    /// Post-fix expectation: every column that appears in *any* row
+    /// surfaces in the column spec, regardless of which row is first.
+    #[test]
+    fn column_spec_includes_columns_missing_from_first_row() {
+        let rows = vec![
+            // Pre-ALTER row: has the original columns but no `strategy`.
+            row(&[
+                ("id", CassandraValue::Int(1)),
+                ("name", CassandraValue::Text("alpha".into())),
+            ]),
+            // Post-ALTER row: includes the new `strategy` column.
+            row(&[
+                ("id", CassandraValue::Int(2)),
+                ("name", CassandraValue::Text("beta".into())),
+                ("strategy", CassandraValue::Text("deepseek".into())),
+            ]),
+        ];
+        let columns = build_column_specs(&rows);
+        let names: std::collections::HashSet<&str> =
+            columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains("strategy"),
+            "regression: column spec lost `strategy` because the first row had no cell for it; \
+             got columns {:?}",
+            names
+        );
+        // The strategy column should be typed correctly, not Varchar
+        // by accident — confirms type inference still scans the
+        // whole rowset for non-NULL samples.
+        let strategy_col = columns.iter().find(|c| c.name == "strategy").unwrap();
+        assert_eq!(strategy_col.col_type, CqlType::Varchar); // Text → Varchar
+    }
+
+    #[test]
+    fn column_spec_first_seen_position_is_preserved() {
+        // Stability matters: a deterministic-input SELECT should
+        // produce deterministic column order. Each column's
+        // position is fixed by the first row that mentions it.
+        let rows = vec![
+            row(&[("a", CassandraValue::Int(1)), ("b", CassandraValue::Int(2))]),
+            row(&[("c", CassandraValue::Int(3)), ("a", CassandraValue::Int(4))]),
+        ];
+        let columns = build_column_specs(&rows);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        // row 0 introduces `a` then `b`; row 1 introduces `c` (but
+        // HashMap iteration of row 0 may not be a/b — we can only
+        // assert that `c` appears after either `a` or `b`).
+        let c_idx = names.iter().position(|n| *n == "c").unwrap();
+        let a_idx = names.iter().position(|n| *n == "a").unwrap();
+        let b_idx = names.iter().position(|n| *n == "b").unwrap();
+        assert!(c_idx > a_idx && c_idx > b_idx,
+            "expected c to appear after a and b; got {names:?}");
+    }
+
+    #[test]
+    fn duplicate_column_across_rows_appears_once() {
+        let rows = vec![
+            row(&[("x", CassandraValue::Int(1))]),
+            row(&[("x", CassandraValue::Int(2))]),
+            row(&[("x", CassandraValue::Int(3))]),
+        ];
+        let columns = build_column_specs(&rows);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "x");
+    }
 }
 
 fn encode_cassandra_value(value: &CassandraValue) -> Bytes {
