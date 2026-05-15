@@ -75,24 +75,50 @@ impl CommitLog {
         Ok(())
     }
     
-    async fn rotate_segment(&mut self) -> Result<()> {
+    /// Rotate to a fresh segment. Used both internally (when the
+    /// current segment hits `segment_size_limit`) and externally by
+    /// `flush_memtable` so the about-to-be-flushed contents end up
+    /// pinned in a fixed segment id that we can safely delete after
+    /// the SSTable write lands. Returns the id of the segment that
+    /// was current BEFORE the rotate, so the caller knows which
+    /// segments are "old data now in SSTable" candidates for cleanup.
+    pub async fn rotate_segment(&mut self) -> Result<u64> {
+        let previous = self.segment_id;
         self.current_segment.flush().await?;
-        
+
         self.segment_id += 1;
         let new_segment_path = self.base_directory
             .join(format!("commitlog-{}.log", self.segment_id));
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(new_segment_path)
             .await?;
-        
+
         self.current_segment = BufWriter::new(file);
         self.current_segment_size = 0;
-        
+
+        Ok(previous)
+    }
+
+    /// Delete every segment file with id `<= up_to_inclusive`. Safe to
+    /// call after `flush_memtable` has rotated and persisted the
+    /// flushed data to SSTable: those segments are guaranteed
+    /// redundant. Best-effort; missing files are not an error.
+    pub async fn delete_segments_up_to(&self, up_to_inclusive: u64) -> Result<()> {
+        for segment_id in 0..=up_to_inclusive {
+            let segment_path = self
+                .base_directory
+                .join(format!("commitlog-{}.log", segment_id));
+            if segment_path.exists() {
+                tokio::fs::remove_file(&segment_path).await?;
+            }
+        }
         Ok(())
     }
+
+    // (`current_segment_id` already exists below — no duplicate accessor.)
     
     /// 복구를 위한 replay 기능
     pub async fn replay_from_segment(&self, segment_id: u64) -> Result<Vec<CommitLogEntry>> {
@@ -132,20 +158,18 @@ impl CommitLog {
         Ok(entries)
     }
     
-    /// 모든 세그먼트에서 replay
+    /// Read every CommitLogEntry from every existing segment on disk.
+    /// Iterates from 0 up to and including the current segment_id so
+    /// gaps left by cleanup (the typical state after a flush) don't
+    /// short-circuit replay before the surviving segments are read.
+    /// Empty segments contribute nothing; truly missing files are
+    /// skipped silently.
     pub async fn replay_all(&self) -> Result<Vec<CommitLogEntry>> {
         let mut all_entries = Vec::new();
-        let mut segment_id = 0;
-        
-        loop {
+        for segment_id in 0..=self.segment_id {
             let entries = self.replay_from_segment(segment_id).await?;
-            if entries.is_empty() {
-                break;
-            }
             all_entries.extend(entries);
-            segment_id += 1;
         }
-        
         Ok(all_entries)
     }
     

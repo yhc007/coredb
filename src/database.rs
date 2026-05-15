@@ -762,33 +762,69 @@ impl CoreDB {
     
     /// 메모리 테이블 플러시
     async fn flush_memtable(&self, keyspace: &str, table: &str) -> Result<()> {
+        // Step 1: rotate the WAL FIRST. New writes that arrive after
+        // this point land in the new segment; everything written
+        // before is fully represented in the memtable we're about to
+        // flush. The returned `pre_rotate` segment id is the last id
+        // whose data is "in the memtable we're flushing" — safe to
+        // delete once the SSTable lands.
+        //
+        // Race window: between this rotate and the memtable swap on
+        // the next line a new INSERT could append to the new segment
+        // while still landing in the OLD memtable. That's fine — the
+        // SSTable write below captures it, AND the new segment
+        // survives the cleanup at the end. Worst case it gets
+        // replayed once on restart, deduped by Memtable::put.
+        let pre_rotate = self
+            .commit_log
+            .write()
+            .await
+            .rotate_segment()
+            .await?;
+
         let mut keyspaces = self.keyspaces.write().await;
         if let Some(ks) = keyspaces.get_mut(keyspace) {
             let mut tables = ks.tables.write().await;
             if let Some(tbl) = tables.get_mut(table) {
-                // 새 메모리 테이블 생성
+                // Swap memtable
                 let new_memtable = Arc::new(Memtable::new(tbl.schema.clone()));
                 let old_memtable = std::mem::replace(&mut tbl.current_memtable, new_memtable);
-                
-                // 기존 메모리 테이블을 SSTable로 변환
+
+                // Convert old memtable to SSTable on disk
                 let sstable_dir = self.config.data_directory
                     .join(keyspace)
                     .join(table);
                 tokio::fs::create_dir_all(&sstable_dir).await?;
-                
+
                 let sstable = SSTable::create_from_memtable(
                     &old_memtable,
                     &sstable_dir,
                     crate::storage::sstable::CompressionType::LZ4
                 ).await?;
-                
+
                 tbl.sstables.push(Arc::new(sstable));
-                
-                // 컴팩션 트리거
+
+                // Trigger compaction
                 self.compaction_manager.schedule_compaction(keyspace, table).await;
             }
         }
-        
+        // Drop the keyspaces write lock before doing file I/O for WAL
+        // cleanup so concurrent INSERTs can resume.
+        drop(keyspaces);
+
+        // Step 2: now that the SSTable is durable, the WAL segments
+        // <= pre_rotate are redundant. Best-effort delete; failures
+        // are logged but don't fail the flush.
+        if let Err(e) = self
+            .commit_log
+            .read()
+            .await
+            .delete_segments_up_to(pre_rotate)
+            .await
+        {
+            tracing::warn!("wal cleanup after flush failed: {e}");
+        }
+
         Ok(())
     }
     
