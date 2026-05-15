@@ -86,9 +86,16 @@ impl CoreDB {
         tokio::fs::create_dir_all(&config.commitlog_directory).await?;
         
         let keyspaces = Arc::new(RwLock::new(HashMap::new()));
-        
-        let commit_log = CommitLog::new(config.commitlog_directory.clone()).await?;
-        let query_engine = QueryEngine::new(keyspaces.clone());
+
+        let commit_log = Arc::new(RwLock::new(
+            CommitLog::new(config.commitlog_directory.clone()).await?,
+        ));
+        // Wire the WAL into the query engine so every CQL INSERT
+        // appends a CommitLogEntry before mutating the memtable.
+        // Without this the WAL stays empty for any data coming via
+        // the native protocol and replay-on-startup is a no-op.
+        let query_engine =
+            QueryEngine::with_commit_log(keyspaces.clone(), commit_log.clone());
         
         let compaction_config = CompactionConfig {
             throughput_mb_per_sec: config.compaction_throughput_mb_per_sec,
@@ -119,7 +126,7 @@ impl CoreDB {
         
         let mut db = Self {
             keyspaces,
-            commit_log: Arc::new(RwLock::new(commit_log)),
+            commit_log,
             query_engine: Arc::new(RwLock::new(query_engine)),
             config,
             compaction_manager: Arc::new(compaction_manager),
@@ -131,14 +138,65 @@ impl CoreDB {
         
         // 시스템 키스페이스 초기화
         db.create_system_keyspaces().await?;
-        
-        // 기존 데이터 로드
+
+        // 기존 데이터 로드 (SSTable on disk)
         db.load_existing_data().await?;
-        
+
+        // WAL replay: any inserts that were appended to the commit
+        // log after the last successful SSTable flush. Without this
+        // step, in-flight memtable data is lost on hard kill
+        // (SIGKILL / power loss / OOM); the 30 s periodic flush only
+        // covers clean shutdowns.
+        let replayed = db.replay_wal().await?;
+        if replayed > 0 {
+            tracing::info!("wal replay: re-applied {replayed} entries into memtables");
+        }
+
         // 백그라운드 작업 시작
         db.start_background_tasks().await;
-        
+
         Ok(db)
+    }
+
+    /// Read every CommitLogEntry from disk and re-apply the mutation
+    /// to the corresponding memtable. Idempotent against rows that
+    /// were already loaded from SSTable — `Memtable::put` overwrites
+    /// by `(partition_key, clustering_key)`, and a duplicate replay
+    /// just lands the same value again.
+    ///
+    /// Caveats:
+    /// - The WAL is never trimmed today, so replay time grows linearly
+    ///   with total append volume across the deployment's lifetime.
+    ///   Hook segment cleanup into flush_memtable in a follow-up.
+    /// - Only `Mutation::Insert` is wired into the engine path right
+    ///   now; UPDATE / DELETE WAL append + replay is a separate turn.
+    ///   Existing CommitLog entries from the old `database::insert_row`
+    ///   surface (paper write path) still replay correctly because the
+    ///   Mutation variants on disk match.
+    async fn replay_wal(&self) -> Result<usize> {
+        let entries = {
+            let cl = self.commit_log.read().await;
+            cl.replay_all().await?
+        };
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0usize;
+        let keyspaces = self.keyspaces.read().await;
+        for entry in entries {
+            let crate::wal::Mutation::Insert(row) = entry.mutation else {
+                continue;
+            };
+            let Some(ks) = keyspaces.get(&entry.keyspace) else {
+                continue;
+            };
+            let tables = ks.tables.read().await;
+            if let Some(table) = tables.get(&entry.table) {
+                let _ = table.current_memtable.put(row);
+                n += 1;
+            }
+        }
+        Ok(n)
     }
     
     /// 기존 SSTable 데이터 로드

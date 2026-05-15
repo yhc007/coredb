@@ -1,6 +1,7 @@
 use crate::schema::{TableSchema, PartitionKey, ClusteringKey, CassandraValue, Row as SchemaRow, Cell};
 use crate::storage::Memtable;
 use crate::query::{CqlStatement, QueryResult, Row as QueryRow};
+use crate::wal::{CommitLog, CommitLogEntry, Mutation};
 use crate::error::*;
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
@@ -32,6 +33,13 @@ fn is_cell_expired(cell: &Cell) -> bool {
 /// 쿼리 엔진
 pub struct QueryEngine {
     keyspaces: Arc<RwLock<HashMap<String, Keyspace>>>,
+    /// Optional WAL handle. When set, INSERT / UPDATE / DELETE
+    /// mutations get appended to the commit log before the in-memory
+    /// memtable mutation, so a crash between memtable write and SSTable
+    /// flush can be replayed on next startup. Wrapped in Option for the
+    /// historical zero-arg `QueryEngine::new` constructor; new callers
+    /// (CoreDB::new) should use `with_commit_log` to wire WAL durability.
+    commit_log: Option<Arc<RwLock<CommitLog>>>,
     current_keyspace: Option<String>,
 }
 
@@ -39,7 +47,46 @@ impl QueryEngine {
     pub fn new(keyspaces: Arc<RwLock<HashMap<String, Keyspace>>>) -> Self {
         Self {
             keyspaces,
+            commit_log: None,
             current_keyspace: None,
+        }
+    }
+
+    /// Variant of `new` that attaches a WAL handle so engine-level
+    /// mutations land in the commit log too. Without this the CQL
+    /// path (every INSERT going through the native protocol) bypasses
+    /// the WAL entirely and any unflushed memtable data is lost on
+    /// crash.
+    pub fn with_commit_log(
+        keyspaces: Arc<RwLock<HashMap<String, Keyspace>>>,
+        commit_log: Arc<RwLock<CommitLog>>,
+    ) -> Self {
+        Self {
+            keyspaces,
+            commit_log: Some(commit_log),
+            current_keyspace: None,
+        }
+    }
+
+    /// Best-effort WAL append. Failures log + continue: a WAL write
+    /// problem at runtime should not bring down the engine (the
+    /// memtable mutation that follows is still in memory and the
+    /// next successful flush will persist it via the SSTable path).
+    async fn wal_append(&self, keyspace: &str, table: &str, mutation: Mutation) {
+        let Some(wal) = self.commit_log.as_ref() else {
+            return;
+        };
+        let entry = CommitLogEntry {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            mutation,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0),
+        };
+        if let Err(e) = wal.write().await.append(entry).await {
+            eprintln!("[wal] append failed: {e}");
         }
     }
     
@@ -523,9 +570,31 @@ impl QueryEngine {
             timestamp: now,
         };
         
-        // 메모리 테이블에 추가
+        // WAL append before memtable put: if we crash between these
+        // two steps the WAL entry is durable and replay will re-apply
+        // on startup. Drop the locks held by the keyspaces.read() /
+        // tables.read() guards while we await the WAL write so the
+        // write doesn't block other CQL traffic.
+        drop(tables);
+        drop(keyspaces);
+        self.wal_append(&keyspace_name, &table, Mutation::Insert(row.clone()))
+            .await;
+        // Re-acquire to hand the row to the memtable. The keyspace +
+        // table must still exist since DROP would require an
+        // exclusive lock we can't get while INSERT is in flight.
+        let keyspaces = self.keyspaces.read().await;
+        let keyspace_struct = keyspaces
+            .get(&keyspace_name)
+            .ok_or(CoreDBError::QueryExecutionError {
+                message: format!("Keyspace '{}' disappeared mid-insert", keyspace_name),
+            })?;
+        let tables = keyspace_struct.tables.read().await;
+        let table_struct =
+            tables.get(&table).ok_or(CoreDBError::QueryExecutionError {
+                message: format!("Table '{}' disappeared mid-insert", table),
+            })?;
         table_struct.current_memtable.put(row)?;
-        
+
         // IF NOT EXISTS 성공 시 [applied] = true 반환
         if if_not_exists {
             let mut result_row = HashMap::new();

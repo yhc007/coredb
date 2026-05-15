@@ -7,6 +7,17 @@ commitlog/
 bench_commitlog/
 sam_commitlog/
 
+# Runtime artifacts from `cargo run --example native_server`. The
+# default config writes data + WAL alongside the crate root; keep
+# them out of git so `git add -A` after a test doesn't commit
+# thousands of SSTable / Bloom / Index files.
+native_server_data/
+native_server_commitlog/
+
+# Stray ledger from adjacent rust-agent runs when commands get
+# executed from this dir by mistake.
+decisions.jsonl
+
 # OS files
 .DS_Store
 *.swp
