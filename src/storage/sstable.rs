@@ -428,13 +428,15 @@ impl SSTable {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         
         // Stats sidecar — optional. Legacy SSTables on disk won't
-        // have one; their `row_count` stays `None` and the COUNT(*)
-        // fast path falls back to slow-scan for *that* file only,
-        // so a partially-upgraded fleet still works.
+        // have one. When absent we backfill it inline: scan every
+        // partition once to count rows, persist the sidecar, then
+        // hand back a fully-stats'd SSTable. One-time cost per
+        // legacy file at startup; subsequent CoreDB starts are
+        // fast.
         let stats_file_path = file_path.with_file_name(
             file_path.file_stem().unwrap().to_string_lossy().replace("-Data", "-Stats") + ".json",
         );
-        let row_count = if stats_file_path.exists() {
+        let row_count_from_sidecar = if stats_file_path.exists() {
             tokio::fs::read_to_string(&stats_file_path)
                 .await
                 .ok()
@@ -444,7 +446,7 @@ impl SSTable {
             None
         };
 
-        Ok(SSTable {
+        let mut sstable = SSTable {
             id,
             file_path: file_path.to_path_buf(),
             bloom_filter,
@@ -454,8 +456,42 @@ impl SSTable {
             max_timestamp: header.max_timestamp,
             compression: header.compression,
             size_bytes: metadata.len(),
-            row_count,
-        })
+            row_count: row_count_from_sidecar,
+        };
+
+        if sstable.row_count.is_none() {
+            // Empty SSTable shortcuts to 0 — no partition reads.
+            if sstable.partition_index.is_empty() {
+                sstable.row_count = Some(0);
+            } else {
+                let mut total: u64 = 0;
+                let keys: Vec<PartitionKey> = sstable.partition_index.keys().cloned().collect();
+                for pk in &keys {
+                    if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                        total += partition.rows.len() as u64;
+                    }
+                }
+                let stats = SSTableStats { version: 1, row_count: total };
+                if let Ok(stats_json) = serde_json::to_string(&stats) {
+                    if let Err(e) = tokio::fs::write(&stats_file_path, stats_json).await {
+                        // Non-fatal: the sidecar will be regenerated
+                        // on the next open. Just log and continue.
+                        tracing::warn!(
+                            "sstable {}: stats backfill write failed ({e}); count fast path will retry next open",
+                            sstable.id,
+                        );
+                    } else {
+                        tracing::info!(
+                            "sstable {}: backfilled stats sidecar (row_count={total})",
+                            sstable.id,
+                        );
+                    }
+                }
+                sstable.row_count = Some(total);
+            }
+        }
+
+        Ok(sstable)
     }
 
     /// 파티션 읽기
