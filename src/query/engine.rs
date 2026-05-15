@@ -837,18 +837,33 @@ impl QueryEngine {
             }
             
             // 요청된 컬럼만 필터링
+            //
+            // For an explicit projection, every requested column must
+            // appear in the resulting row's cell map — including ones
+            // that this particular row has no value for. Otherwise the
+            // result-frame builder in protocol/handler.rs has no way
+            // to surface the column at all when *every* row predates
+            // an `ALTER TABLE ... ADD col`, and the scylla driver's
+            // typed-row deserializer rejects the entire response with
+            // "values for columns [...] are missing from the DB data
+            // but are required by the Rust type". Synthesize a Null
+            // cell for the missing column so the column slot stays
+            // present and the wire-level shape is stable across
+            // pre-/post-ALTER row mixes.
             let mut final_cells = HashMap::new();
             if columns.contains(&"*".to_string()) || !aggregations.is_empty() {
                 // aggregation이 있으면 모든 컬럼 필요
                 final_cells = cells;
             } else {
                 for col in &columns {
-                    if let Some(val) = cells.get(col) {
-                        final_cells.insert(col.clone(), val.clone());
-                    }
+                    let val = cells
+                        .get(col)
+                        .cloned()
+                        .unwrap_or(crate::schema::CassandraValue::Null);
+                    final_cells.insert(col.clone(), val);
                 }
             }
-            
+
             query_rows.push(QueryRow { columns: final_cells });
         }
         
