@@ -632,58 +632,121 @@ impl QueryEngine {
         } else {
             None
         };
-        
-        let mut result_rows = Vec::new();
-        
-        if let Some(pk) = partition_key {
-            // 1. Memtable 검색
-            let rows = table_struct.current_memtable.range_scan(&pk, &None, &None);
-            for row in rows {
-                result_rows.push(row);
+
+        // Fast path: `SELECT * FROM ks.t LIMIT 1` with no WHERE / no
+        // aggregation / no GROUP BY / no DISTINCT / no ORDER BY.
+        // Used heavily by `verify_tables` (post-migrate smoke check)
+        // and any operator running `cqlsh> SELECT * FROM t LIMIT 1`
+        // against a big partition. The classic full-scan path reads
+        // every partition into memory before truncating to N rows;
+        // on the daemon's 206k-row btc_ticks table that wedges at
+        // the default 30s query timeout.
+        //
+        // We just need a single row to satisfy the LIMIT. Take the
+        // first one we can find across memtable → immutable
+        // memtables → SSTables (in that order — newest data first,
+        // so the row we return is the most recently visible one).
+        let fast_path_eligible = where_clause.is_none()
+            && partition_key.is_none()
+            && aggregations.is_empty()
+            && group_by.is_empty()
+            && order_by.is_none()
+            && !distinct
+            && limit == Some(1);
+
+        let mut result_rows: Vec<SchemaRow> = Vec::new();
+
+        if fast_path_eligible {
+            'fast: {
+                // 1. Current memtable.
+                let parts = table_struct.current_memtable.get_all_partitions();
+                for (_, partition) in parts {
+                    if let Some(entry) = partition.rows.iter().next() {
+                        result_rows.push(entry.value().clone());
+                        break 'fast;
+                    }
+                }
+                // 2. Immutable memtables.
+                for mt in &table_struct.memtables {
+                    let parts = mt.get_all_partitions();
+                    for (_, partition) in parts {
+                        if let Some(entry) = partition.rows.iter().next() {
+                            result_rows.push(entry.value().clone());
+                            break 'fast;
+                        }
+                    }
+                }
+                // 3. SSTables — read the very first partition only.
+                for sstable in &table_struct.sstables {
+                    if let Some(first_pk) = sstable.partition_index.keys().next() {
+                        if let Ok(Some(partition)) = sstable.read_partition(first_pk).await {
+                            if let Some(entry) = partition.rows.iter().next() {
+                                result_rows.push(entry.value().clone());
+                                break 'fast;
+                            }
+                        }
+                    }
+                }
+                // Table genuinely empty — leave result_rows empty
+                // and fall through to the regular post-processing
+                // tail which handles that case cleanly.
             }
-            
-            // 2. Immutable Memtables 검색
-            for memtable in &table_struct.memtables {
-                let rows = memtable.range_scan(&pk, &None, &None);
+        }
+        
+        // Skip the regular scan path if the fast path already
+        // populated `result_rows` with a single row (or definitively
+        // proved the table empty).
+        if !fast_path_eligible {
+            if let Some(pk) = partition_key {
+                // 1. Memtable 검색
+                let rows = table_struct.current_memtable.range_scan(&pk, &None, &None);
                 for row in rows {
                     result_rows.push(row);
                 }
-            }
-            
-            // 3. SSTables 검색
-            for sstable in &table_struct.sstables {
-                if let Some(partition) = sstable.read_partition(&pk).await? {
-                    for entry in partition.rows.iter() {
-                        result_rows.push(entry.value().clone());
+
+                // 2. Immutable Memtables 검색
+                for memtable in &table_struct.memtables {
+                    let rows = memtable.range_scan(&pk, &None, &None);
+                    for row in rows {
+                        result_rows.push(row);
                     }
                 }
-            }
-        } else {
-            // 전체 스캔
-            // 1. Current Memtable
-            let partitions = table_struct.current_memtable.get_all_partitions();
-            for (_, partition) in partitions {
-                for entry in partition.rows.iter() {
-                    result_rows.push(entry.value().clone());
+
+                // 3. SSTables 검색
+                for sstable in &table_struct.sstables {
+                    if let Some(partition) = sstable.read_partition(&pk).await? {
+                        for entry in partition.rows.iter() {
+                            result_rows.push(entry.value().clone());
+                        }
+                    }
                 }
-            }
-            
-            // 2. Immutable Memtables
-            for memtable in &table_struct.memtables {
-                let partitions = memtable.get_all_partitions();
+            } else {
+                // 전체 스캔
+                // 1. Current Memtable
+                let partitions = table_struct.current_memtable.get_all_partitions();
                 for (_, partition) in partitions {
                     for entry in partition.rows.iter() {
                         result_rows.push(entry.value().clone());
                     }
                 }
-            }
-            
-            // 3. SSTables - full scan
-            for sstable in &table_struct.sstables {
-                for pk in sstable.partition_index.keys() {
-                    if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+
+                // 2. Immutable Memtables
+                for memtable in &table_struct.memtables {
+                    let partitions = memtable.get_all_partitions();
+                    for (_, partition) in partitions {
                         for entry in partition.rows.iter() {
                             result_rows.push(entry.value().clone());
+                        }
+                    }
+                }
+
+                // 3. SSTables - full scan
+                for sstable in &table_struct.sstables {
+                    for pk in sstable.partition_index.keys() {
+                        if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                            for entry in partition.rows.iter() {
+                                result_rows.push(entry.value().clone());
+                            }
                         }
                     }
                 }

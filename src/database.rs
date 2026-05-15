@@ -1705,6 +1705,86 @@ mod tests {
         assert!(result.is_success());
     }
 
+    /// Regression: `SELECT * FROM ks.t LIMIT 1` with no WHERE must
+    /// short-circuit after finding one row instead of materializing
+    /// the whole table. The pre-fix full-scan path read every row
+    /// before truncating to N; on a 200k-row table that wedges at
+    /// the default query timeout.
+    ///
+    /// Functional smoke test: drop in 5 rows, verify LIMIT 1 returns
+    /// exactly one. Performance is the real motivation but isn't
+    /// testable in a unit test cheaply — the structural guarantee
+    /// (one row out, no crash, no missing data) is the contract we
+    /// lock in here.
+    #[tokio::test]
+    async fn test_select_limit_1_returns_one_row() {
+        use crate::query::QueryResult;
+
+        let config = DatabaseConfig::default();
+        let db = CoreDB::new(config).await.unwrap();
+
+        let ks = format!("test_limit1_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+        for i in 0..5 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'row-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t LIMIT 1"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "LIMIT 1 must return exactly 1 row, got {}", rows.len());
+        // Returned row should have both columns of the table (id + name).
+        let row = &rows[0];
+        assert!(row.columns.contains_key("id"), "missing id; got {:?}", row.columns.keys().collect::<Vec<_>>());
+        assert!(row.columns.contains_key("name"));
+    }
+
+    #[tokio::test]
+    async fn test_select_limit_1_empty_table() {
+        use crate::query::QueryResult;
+
+        let config = DatabaseConfig::default();
+        let db = CoreDB::new(config).await.unwrap();
+        let ks = format!("test_limit1_empty_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t LIMIT 1"))
+            .await
+            .unwrap();
+        match &result {
+            QueryResult::Rows(r) => assert!(r.is_empty(), "empty table should yield 0 rows"),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
     /// Regression: a SELECT projection that includes a column added by
     /// `ALTER TABLE ... ADD col` must surface that column for every
     /// returned row — even when *every* row in the response was
