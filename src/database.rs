@@ -751,18 +751,39 @@ impl CoreDB {
     
     /// 메모리 테이블 플러시 체크
     async fn check_memtable_flush(&self) -> Result<()> {
-        let keyspaces = self.keyspaces.read().await;
-        
-        for (keyspace_name, keyspace) in keyspaces.iter() {
-            let tables = keyspace.tables.read().await;
-            
-            for (table_name, table) in tables.iter() {
-                if table.current_memtable.size_bytes() > self.config.memtable_flush_threshold_mb * 1024 * 1024 {
-                    self.flush_memtable(keyspace_name, table_name).await?;
+        // Collect the (keyspace, table) pairs that need flushing
+        // FIRST, with read locks held, then drop those locks before
+        // calling flush_memtable (which needs WRITE locks). Without
+        // the drop, the read-then-write pattern same-task-deadlocks
+        // on tokio's RwLock: flush_memtable's write-lock acquire
+        // waits forever for the read lock we still hold ourselves.
+        //
+        // Saturating multiply on the threshold→bytes conversion so a
+        // pathologically-large config (e.g. u64::MAX/1024/1024 set
+        // by a test to mean "never flush") doesn't wrap to 0 and
+        // accidentally flush every non-empty memtable.
+        let mut to_flush: Vec<(String, String)> = Vec::new();
+        {
+            let keyspaces = self.keyspaces.read().await;
+            for (keyspace_name, keyspace) in keyspaces.iter() {
+                let tables = keyspace.tables.read().await;
+                for (table_name, table) in tables.iter() {
+                    let threshold_bytes = self
+                        .config
+                        .memtable_flush_threshold_mb
+                        .saturating_mul(1024)
+                        .saturating_mul(1024);
+                    if table.current_memtable.size_bytes() > threshold_bytes {
+                        to_flush.push((keyspace_name.clone(), table_name.clone()));
+                    }
                 }
             }
         }
-        
+
+        for (keyspace, table) in to_flush {
+            self.flush_memtable(&keyspace, &table).await?;
+        }
+
         Ok(())
     }
     
@@ -884,6 +905,40 @@ impl CoreDB {
         Ok(())
     }
     
+    /// Spawn a background task that calls [`Self::check_memtable_flush`]
+    /// on a fixed interval so a write-heavy workload auto-rotates
+    /// memtables once they cross `config.memtable_flush_threshold_mb`.
+    /// Without this, a hot CQL stream coming through the native
+    /// protocol keeps growing the live memtable until the process
+    /// exits cleanly (via [`Self::flush_all`]) or restarts.
+    ///
+    /// Use a tight interval (1-2 s) for high-throughput workloads
+    /// and a longer one (5-10 s) for the agent's few-KB-per-day
+    /// pattern. The check itself is cheap (one O(1) atomic read per
+    /// table); the actual flush only runs when at least one
+    /// memtable is over threshold.
+    ///
+    /// Pairs with [`Self::spawn_periodic_flush`]: the size watcher
+    /// keeps memory bounded under load, the periodic flush is the
+    /// durability backstop for idle / low-write tables.
+    pub fn spawn_size_threshold_watcher(
+        self: std::sync::Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately; skip it.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(e) = self.check_memtable_flush().await {
+                    tracing::warn!("size-threshold flush check failed: {e}");
+                }
+            }
+        })
+    }
+
     /// Spawn a background task that calls [`Self::flush_all`] on a
     /// fixed interval, so low-write workloads still hit SSTable
     /// regularly even when the size-threshold-based flush in
@@ -2006,6 +2061,136 @@ mod tests {
             other => panic!("expected BigInt, got {other:?}"),
         }
         let _ = db2; // hold the DB open across the assertion above
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// `check_memtable_flush` flushes only the tables whose memtable
+    /// crosses `memtable_flush_threshold_mb`. Pin both branches:
+    /// (a) a small memtable stays in memory across the call (no
+    /// premature flush, no SSTable created), and (b) a memtable
+    /// over the threshold gets rotated + serialized in the same
+    /// call. Threshold is set to 0 MB to force every non-empty
+    /// memtable past the line — simpler than calibrating bytes
+    /// against the schema's serialized form.
+    #[tokio::test]
+    async fn check_memtable_flush_only_rotates_over_threshold() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_threshold_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // (a) Run with a huge threshold first → flush should be a
+        // no-op even with rows present.
+        let mut huge_config = DatabaseConfig::default();
+        huge_config.data_directory = data_dir.join("huge");
+        huge_config.commitlog_directory = data_dir.join("huge_commitlog");
+        huge_config.memtable_flush_threshold_mb = u64::MAX / 1024 / 1024;
+        let db_huge = CoreDB::new(huge_config.clone()).await.unwrap();
+        let ks = format!("test_thresh_ks_{}", std::process::id());
+        db_huge
+            .execute_cql(&format!(
+                "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .unwrap();
+        db_huge
+            .execute_cql(&format!(
+                "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+            ))
+            .await
+            .unwrap();
+        for i in 0..10 {
+            db_huge
+                .execute_cql(&format!(
+                    "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'r{i}')"
+                ))
+                .await
+                .unwrap();
+        }
+        db_huge.check_memtable_flush().await.unwrap();
+        let tbl_dir_huge = huge_config.data_directory.join(&ks).join("t");
+        let huge_sstables = std::fs::read_dir(&tbl_dir_huge)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.ends_with("-Data.db"))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            huge_sstables, 0,
+            "no SSTable should have been created when threshold is enormous",
+        );
+        // Sanity: the rows are still visible via SELECT (they live
+        // in the memtable still).
+        let result_huge = db_huge
+            .execute_cql(&format!("SELECT * FROM {ks}.t"))
+            .await
+            .unwrap();
+        let rows_huge = match &result_huge {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(
+            rows_huge.len(),
+            10,
+            "rows must stay visible even when flush is suppressed by threshold",
+        );
+
+        // (b) Tiny threshold → next check_memtable_flush rotates +
+        // writes SSTable for every non-empty table.
+        let mut tiny_config = DatabaseConfig::default();
+        tiny_config.data_directory = data_dir.join("tiny");
+        tiny_config.commitlog_directory = data_dir.join("tiny_commitlog");
+        tiny_config.memtable_flush_threshold_mb = 0;
+        let db_tiny = CoreDB::new(tiny_config.clone()).await.unwrap();
+        db_tiny
+            .execute_cql(&format!(
+                "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .unwrap();
+        db_tiny
+            .execute_cql(&format!(
+                "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+            ))
+            .await
+            .unwrap();
+        for i in 0..10 {
+            db_tiny
+                .execute_cql(&format!(
+                    "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'r{i}')"
+                ))
+                .await
+                .unwrap();
+        }
+        db_tiny.check_memtable_flush().await.unwrap();
+        let tbl_dir_tiny = tiny_config.data_directory.join(&ks).join("t");
+        let tiny_sstables = std::fs::read_dir(&tbl_dir_tiny)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.ends_with("-Data.db"))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert!(
+            tiny_sstables >= 1,
+            "at least one SSTable should have been created when threshold is 0; got {tiny_sstables}",
+        );
+
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

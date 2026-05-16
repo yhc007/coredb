@@ -56,6 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .spawn_periodic_flush(std::time::Duration::from_secs(30));
 
+    // Size-threshold watcher: ticks every 2 s and flushes any table
+    // whose memtable has crossed `memtable_flush_threshold_mb`
+    // (default 64 MB). Without this a hot CQL stream coming through
+    // the native protocol grows the live memtable unboundedly
+    // between the 30 s periodic flushes above.
+    let _size_watch_handle = db
+        .clone()
+        .spawn_size_threshold_watcher(std::time::Duration::from_secs(2));
+
     // 서버 설정
     let server_config = ServerConfig {
         host: "0.0.0.0".to_string(),
