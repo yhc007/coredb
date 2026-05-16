@@ -798,8 +798,17 @@ impl QueryEngine {
                     }
                 }
 
-                // 3. SSTables 검색
+                // 3. SSTables 검색 — skip SSTables whose persisted
+                // [min, max] partition-key range doesn't cover `pk`.
+                // The veto is O(1) on the in-memory bounds; without
+                // it every SSTable would pay an async dispatch +
+                // partition_index BTreeMap lookup even for hopeless
+                // candidates. Big win once a table accumulates many
+                // bucket-keyed SSTables (decisions, btc_ticks, etc.).
                 for sstable in &table_struct.sstables {
+                    if sstable.excludes_partition_key(&pk) {
+                        continue;
+                    }
                     if let Some(partition) = sstable.read_partition(&pk).await? {
                         for entry in partition.rows.iter() {
                             result_rows.push(entry.value().clone());

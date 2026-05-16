@@ -720,8 +720,14 @@ impl CoreDB {
                     return Ok(Some(row));
                 }
                 
-                // SSTable에서 검색
+                // SSTable에서 검색 — same engine-level bounds veto
+                // as query/engine.rs::select_rows. Avoids paying the
+                // async-fn dispatch + partition_index lookup for
+                // SSTables that provably don't cover this key.
                 for sstable in &tbl.sstables {
+                    if sstable.excludes_partition_key(partition_key) {
+                        continue;
+                    }
                     if let Some(partition) = sstable.read_partition(partition_key).await? {
                         // 클러스터링 키가 있다면 해당 행만 반환
                         if let Some(ref ck) = clustering_key {
@@ -1950,6 +1956,86 @@ mod tests {
             other => panic!("expected BigInt, got {other:?}"),
         }
         let _ = db2; // hold the DB open across the assertion above
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// SSTable bounds pruning at the engine level: after flushing
+    /// rows into an SSTable, a point lookup for a partition key
+    /// outside the SSTable's min/max range returns zero rows
+    /// without falling over. The test doesn't directly verify the
+    /// `continue;` branch ran (no perf counter), but it nails the
+    /// correctness side: vetoing the SSTable must not lose data
+    /// from any other source (memtable, other SSTables) and must
+    /// not erroneously veto in-range keys.
+    #[tokio::test]
+    async fn test_select_with_partition_key_outside_sstable_bounds() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_engine_prune_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut config = DatabaseConfig::default();
+        config.data_directory = data_dir.join("data");
+        config.commitlog_directory = data_dir.join("commitlog");
+        let db = CoreDB::new(config.clone()).await.unwrap();
+
+        let ks = format!("test_engine_prune_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+        // Insert ids 10..=12 and flush so the SSTable's bounds are
+        // [10, 12] inclusive. The engine's veto should fire on any
+        // key outside that range.
+        for i in 10..=12 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'in-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+        db.flush_all().await.ok();
+
+        // In-range key (12) — must return one row.
+        let in_range = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t WHERE id = 12"))
+            .await
+            .unwrap();
+        let rows = match &in_range {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows for in-range, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "in-range key should return its row");
+
+        // Out-of-range keys — must return zero rows. The engine's
+        // bounds veto is exercised here: with the SSTable's range
+        // [10, 12], lookups for id=1 and id=99 both hit the
+        // `if sstable.excludes_partition_key(&pk) { continue; }`
+        // branch and never call read_partition.
+        for missing_id in [1, 99] {
+            let result = db
+                .execute_cql(&format!("SELECT * FROM {ks}.t WHERE id = {missing_id}"))
+                .await
+                .unwrap();
+            let rows = match &result {
+                crate::query::QueryResult::Rows(r) => r,
+                other => panic!("expected Rows for id={missing_id}, got {other:?}"),
+            };
+            assert!(
+                rows.is_empty(),
+                "out-of-range key id={missing_id} should return 0 rows, got {}",
+                rows.len(),
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

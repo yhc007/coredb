@@ -577,6 +577,27 @@ impl SSTable {
         Ok(sstable)
     }
 
+    /// Cheap O(1) range check against this SSTable's persisted
+    /// `[min_partition_key, max_partition_key]` bounds. Returns
+    /// `true` only when the key is *provably* outside the range —
+    /// safe to skip this SSTable without entering [`Self::read_partition`].
+    /// Returns `false` when the bounds are unknown (legacy v1 stats
+    /// sidecar, empty SSTable) so the caller falls through to the
+    /// standard read path.
+    ///
+    /// Intended for the engine's point-lookup paths so they can
+    /// `continue` over irrelevant SSTables without dispatching an
+    /// async fn. `read_partition` enforces the same veto internally
+    /// as a safety net — skipping this check still produces correct
+    /// results; it just costs the async dispatch + BTreeMap lookup
+    /// this would have avoided.
+    pub fn excludes_partition_key(&self, key: &PartitionKey) -> bool {
+        match (&self.min_partition_key, &self.max_partition_key) {
+            (Some(min), Some(max)) => key < min || key > max,
+            _ => false,
+        }
+    }
+
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
         // Range veto: O(1) bounds check before the O(log N)
@@ -825,6 +846,62 @@ mod tests {
         assert_eq!(reopened.max_partition_key.as_ref(), Some(&max_expected));
 
         sstable.delete().await.unwrap();
+    }
+
+    /// `excludes_partition_key` is the cheap O(1) bounds check the
+    /// engine point-lookup path uses to skip irrelevant SSTables
+    /// without dispatching the async `read_partition`. Bounds-known
+    /// SSTables veto out-of-range keys and pass in-range keys
+    /// through; bounds-unknown SSTables (legacy v1 sidecars, empty
+    /// SSTables) never veto — they fall through to the standard
+    /// read path which is still correct.
+    #[tokio::test]
+    async fn excludes_partition_key_only_vetoes_when_bounds_known() {
+        let temp_dir = std::env::temp_dir().join("coredb_test_excl_pk");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let schema = create_test_schema();
+        let memtable = crate::storage::Memtable::new(schema);
+        for i in [10, 20, 30] {
+            memtable.put(create_test_row(i, (i * 1000) as i64, "v")).unwrap();
+        }
+        let mut sstable = SSTable::create_from_memtable(&memtable, &temp_dir, CompressionType::None)
+            .await
+            .unwrap();
+
+        // Bounds-known: in-range / out-of-range answers match
+        // partition-key ordering.
+        let in_range = PartitionKey { components: vec![CassandraValue::Int(20)] };
+        let above_range = PartitionKey { components: vec![CassandraValue::Int(99)] };
+        let below_range = PartitionKey { components: vec![CassandraValue::Int(0)] };
+        assert!(!sstable.excludes_partition_key(&in_range));
+        assert!(sstable.excludes_partition_key(&above_range));
+        assert!(sstable.excludes_partition_key(&below_range));
+        // Boundary inclusivity: equal to min/max is NOT excluded.
+        assert!(!sstable.excludes_partition_key(
+            sstable.min_partition_key.as_ref().unwrap()
+        ));
+        assert!(!sstable.excludes_partition_key(
+            sstable.max_partition_key.as_ref().unwrap()
+        ));
+
+        // Bounds-unknown: simulate a legacy SSTable that didn't
+        // record bounds (e.g. v1 sidecar that hadn't been
+        // backfilled yet). `excludes_partition_key` must NEVER veto
+        // in this state — the caller has to consult read_partition
+        // and the partition_index instead. Letting it veto here
+        // would silently hide every key on a legacy SSTable until
+        // its first reopen.
+        sstable.min_partition_key = None;
+        sstable.max_partition_key = None;
+        assert!(!sstable.excludes_partition_key(&in_range));
+        assert!(!sstable.excludes_partition_key(&above_range));
+        assert!(!sstable.excludes_partition_key(&below_range));
+
+        sstable.delete().await.ok();
     }
 
     /// `read_partition` short-circuits with `Ok(None)` when the
