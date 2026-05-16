@@ -766,7 +766,16 @@ impl CoreDB {
         Ok(())
     }
     
-    /// 메모리 테이블 플러시
+    /// 메모리 테이블 플러시.
+    ///
+    /// The two slow steps — serializing the memtable into an SSTable
+    /// and the cleanup file I/O — both run *without* the keyspaces
+    /// / tables write locks held. Concurrent INSERTs land in a fresh
+    /// empty memtable while the rotated one is being drained to
+    /// disk; SELECTs merge `current_memtable ∪ memtables ∪ sstables`
+    /// (in that order, see [`QueryEngine::select_rows`]) so the
+    /// rotated memtable stays readable until the SSTable is
+    /// published.
     async fn flush_memtable(&self, keyspace: &str, table: &str) -> Result<()> {
         // Step 1: rotate the WAL FIRST. New writes that arrive after
         // this point land in the new segment; everything written
@@ -788,37 +797,78 @@ impl CoreDB {
             .rotate_segment()
             .await?;
 
-        let mut keyspaces = self.keyspaces.write().await;
-        if let Some(ks) = keyspaces.get_mut(keyspace) {
+        // Step 2: under the write lock, swap a fresh memtable in for
+        // writes AND park the rotated one in the immutable list so
+        // readers can still see its rows while the SSTable write
+        // grinds. Lock released immediately after — concurrent
+        // INSERTs only see the brief swap, not the multi-second
+        // serialization that follows.
+        let old_memtable: Arc<Memtable> = {
+            let mut keyspaces = self.keyspaces.write().await;
+            let Some(ks) = keyspaces.get_mut(keyspace) else {
+                return Ok(());
+            };
             let mut tables = ks.tables.write().await;
-            if let Some(tbl) = tables.get_mut(table) {
-                // Swap memtable
-                let new_memtable = Arc::new(Memtable::new(tbl.schema.clone()));
-                let old_memtable = std::mem::replace(&mut tbl.current_memtable, new_memtable);
+            let Some(tbl) = tables.get_mut(table) else {
+                return Ok(());
+            };
+            let new_memtable = Arc::new(Memtable::new(tbl.schema.clone()));
+            let old = std::mem::replace(&mut tbl.current_memtable, new_memtable);
+            tbl.memtables.push(Arc::clone(&old));
+            old
+        };
 
-                // Convert old memtable to SSTable on disk
-                let sstable_dir = self.config.data_directory
-                    .join(keyspace)
-                    .join(table);
-                tokio::fs::create_dir_all(&sstable_dir).await?;
+        // Step 3: serialize the rotated memtable to disk with NO
+        // locks held. The path-prep + SSTable write are the slow
+        // parts of a flush; under the old code they ran inline,
+        // freezing every concurrent SELECT / INSERT against this
+        // database. The rotation lets that work continue without
+        // waiting on us.
+        let sstable_dir = self
+            .config
+            .data_directory
+            .join(keyspace)
+            .join(table);
+        tokio::fs::create_dir_all(&sstable_dir).await?;
 
-                let sstable = SSTable::create_from_memtable(
-                    &old_memtable,
-                    &sstable_dir,
-                    crate::storage::sstable::CompressionType::LZ4
-                ).await?;
+        let sstable = SSTable::create_from_memtable(
+            &old_memtable,
+            &sstable_dir,
+            crate::storage::sstable::CompressionType::LZ4,
+        )
+        .await?;
 
-                tbl.sstables.push(Arc::new(sstable));
-
-                // Trigger compaction
-                self.compaction_manager.schedule_compaction(keyspace, table).await;
+        // Step 4: publish the SSTable + retire the rotated memtable
+        // under the write lock. Push SSTable BEFORE removing the
+        // rotated memtable from `tbl.memtables` so readers always
+        // see the data through at least one source — the brief
+        // overlap is handled by the engine's existing (pk, ck)
+        // dedup. Use Arc::ptr_eq to retire exactly the memtable we
+        // rotated; concurrent flushes (different tables, or the
+        // same table back-to-back) leave each other's entries
+        // untouched.
+        let did_schedule_compaction = {
+            let mut keyspaces = self.keyspaces.write().await;
+            if let Some(ks) = keyspaces.get_mut(keyspace) {
+                let mut tables = ks.tables.write().await;
+                if let Some(tbl) = tables.get_mut(table) {
+                    tbl.sstables.push(Arc::new(sstable));
+                    tbl.memtables.retain(|m| !Arc::ptr_eq(m, &old_memtable));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
-        }
-        // Drop the keyspaces write lock before doing file I/O for WAL
-        // cleanup so concurrent INSERTs can resume.
-        drop(keyspaces);
+        };
 
-        // Step 2: now that the SSTable is durable, the WAL segments
+        // Trigger compaction outside the write lock.
+        if did_schedule_compaction {
+            self.compaction_manager.schedule_compaction(keyspace, table).await;
+        }
+
+        // Step 5: now that the SSTable is durable, the WAL segments
         // <= pre_rotate are redundant. Best-effort delete; failures
         // are logged but don't fail the flush.
         if let Err(e) = self
@@ -1956,6 +2006,104 @@ mod tests {
             other => panic!("expected BigInt, got {other:?}"),
         }
         let _ = db2; // hold the DB open across the assertion above
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Concurrent INSERTs during a flush all survive. Rotate to an
+    /// immutable memtable + serialize is supposed to release the
+    /// write lock immediately after the rotation, so writes hitting
+    /// the table during the (slower) SSTable serialization step
+    /// land in a fresh memtable rather than blocking on the flush.
+    /// Verify by spawning 100 inserts in parallel with `flush_all`
+    /// and asserting every row is queryable afterwards.
+    ///
+    /// This wouldn't have passed under the pre-rotation code path —
+    /// the write lock spanned the whole serialize step, so
+    /// concurrent INSERTs would block until the SSTable hit disk.
+    /// They'd still land (no rows would be lost), but the test
+    /// timing would force them to be serialized after the flush.
+    /// The new code lets them interleave; the assertion is just
+    /// "all rows present", which is the durable contract either way.
+    #[tokio::test]
+    async fn flush_memtable_rotates_for_concurrent_writes() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_flush_rotate_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut config = DatabaseConfig::default();
+        config.data_directory = data_dir.join("data");
+        config.commitlog_directory = data_dir.join("commitlog");
+        let db = std::sync::Arc::new(CoreDB::new(config.clone()).await.unwrap());
+
+        let ks = format!("test_flush_rotate_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+
+        // Pre-flush rows: ids 0..50 land in the live memtable.
+        for i in 0..50 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'pre-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Spawn flush and concurrent inserts. The flush rotates the
+        // memtable as soon as it starts; the inserts that follow
+        // land in the fresh memtable. The pre-flush rows live in
+        // tbl.memtables (the rotated entry) until the SSTable lands.
+        let db_flush = std::sync::Arc::clone(&db);
+        let flush_handle = tokio::spawn(async move {
+            db_flush.flush_all().await.unwrap();
+        });
+        let mut insert_handles = Vec::new();
+        for i in 50..150 {
+            let db_ins = std::sync::Arc::clone(&db);
+            let ks_ins = ks.clone();
+            insert_handles.push(tokio::spawn(async move {
+                db_ins
+                    .execute_cql(&format!(
+                        "INSERT INTO {ks_ins}.t (id, name) VALUES ({i}, 'post-{i}')"
+                    ))
+                    .await
+                    .unwrap();
+            }));
+        }
+        flush_handle.await.unwrap();
+        for h in insert_handles {
+            h.await.unwrap();
+        }
+
+        // All 150 rows must be visible via SELECT. The pre-flush
+        // ones come from the SSTable; the post-flush ones come
+        // from the new live memtable. None should be lost in
+        // transit through the rotation.
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(
+            rows.len(),
+            150,
+            "all 50 pre + 100 post rows must be present after flush+concurrent inserts, got {}",
+            rows.len(),
+        );
+
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
