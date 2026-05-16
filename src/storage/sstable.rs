@@ -100,10 +100,17 @@ impl SSTable {
         let data_file_path = base_dir.join(format!("{}-Data.db", sstable_id));
         
         let mut data_file = File::create(&data_file_path).await?;
-        
+
+        // The external `bloomfilter` crate's `new` panics on
+        // items_count = 0. Caller paths that rotate an empty
+        // memtable (e.g. a freshly-rotated immutable in the
+        // size-threshold watcher's loop) would crash the runtime;
+        // floor to 1 so the SSTable can still be written (empty
+        // partition_index → readers return None for every key
+        // anyway, which is the correct behavior).
         let mut bloom_filter = BloomFilter::new(
-            memtable.partition_count() as u64, 
-            0.01
+            (memtable.partition_count() as u64).max(1),
+            0.01,
         );
         
         let mut partition_index = BTreeMap::new();

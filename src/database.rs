@@ -76,6 +76,13 @@ pub struct CoreDB {
     pub users: Arc<RwLock<HashMap<String, crate::schema::User>>>,
     /// Roles (Authorization)
     pub roles: Arc<RwLock<HashMap<String, crate::schema::Role>>>,
+    /// Wakeup signal for the size-threshold flush watcher. The
+    /// engine notifies after every memtable put; the watcher's
+    /// background loop awaits this Notify alongside its interval
+    /// tick so hot write workloads trigger a flush as soon as the
+    /// threshold is crossed instead of waiting for the next poll.
+    /// Shared with QueryEngine via Arc<Notify>.
+    flush_wakeup: Arc<tokio::sync::Notify>,
 }
 
 impl CoreDB {
@@ -94,8 +101,9 @@ impl CoreDB {
         // appends a CommitLogEntry before mutating the memtable.
         // Without this the WAL stays empty for any data coming via
         // the native protocol and replay-on-startup is a no-op.
-        let query_engine =
-            QueryEngine::with_commit_log(keyspaces.clone(), commit_log.clone());
+        let flush_wakeup = Arc::new(tokio::sync::Notify::new());
+        let query_engine = QueryEngine::with_commit_log(keyspaces.clone(), commit_log.clone())
+            .with_flush_wakeup(flush_wakeup.clone());
         
         let compaction_config = CompactionConfig {
             throughput_mb_per_sec: config.compaction_throughput_mb_per_sec,
@@ -134,6 +142,7 @@ impl CoreDB {
             index_manager,
             users,
             roles,
+            flush_wakeup,
         };
         
         // 시스템 키스페이스 초기화
@@ -925,13 +934,23 @@ impl CoreDB {
         self: std::sync::Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let wakeup = Arc::clone(&self.flush_wakeup);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // First tick fires immediately; skip it.
             tick.tick().await;
             loop {
-                tick.tick().await;
+                // Wake on either the interval (durability backstop —
+                // catches stuck/leaked notifies and idle tables that
+                // never crossed the threshold) or the wakeup notify
+                // (engine signal — fires within microseconds of a
+                // threshold-crossing put). Multiple notifies during
+                // one scan coalesce into a single wakeup permit.
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = wakeup.notified() => {}
+                }
                 if let Err(e) = self.check_memtable_flush().await {
                     tracing::warn!("size-threshold flush check failed: {e}");
                 }
@@ -2061,6 +2080,89 @@ mod tests {
             other => panic!("expected BigInt, got {other:?}"),
         }
         let _ = db2; // hold the DB open across the assertion above
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Notify-based wakeup: when the size-threshold watcher is
+    /// running with a long interval (3 s here), an INSERT that
+    /// pushes the memtable over the threshold should trigger the
+    /// flush well before the next interval tick — i.e. on the
+    /// engine's notify signal, not on the timer. Pin this so a
+    /// refactor that drops the engine→watcher notify channel
+    /// fails loudly (the test would time out at the assertion).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn size_threshold_watcher_wakes_on_engine_notify() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_notify_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut config = DatabaseConfig::default();
+        config.data_directory = data_dir.join("data");
+        config.commitlog_directory = data_dir.join("commitlog");
+        // Threshold 0 → every non-empty memtable is over threshold.
+        config.memtable_flush_threshold_mb = 0;
+        let db = std::sync::Arc::new(CoreDB::new(config.clone()).await.unwrap());
+
+        // Start the watcher with a deliberately long interval so any
+        // flush that happens must come from the notify path, not the
+        // timer. 3 s tick + 100 ms assertion budget = 30× margin.
+        let _watcher = std::sync::Arc::clone(&db)
+            .spawn_size_threshold_watcher(std::time::Duration::from_secs(3));
+
+        let ks = format!("test_notify_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+        // Single INSERT — the resulting memtable is over threshold,
+        // engine notifies, watcher wakes within microseconds.
+        db.execute_cql(&format!(
+            "INSERT INTO {ks}.t (id, name) VALUES (1, 'one')"
+        ))
+        .await
+        .unwrap();
+
+        // Poll for the SSTable file to appear. The watcher should
+        // process the notify and complete the flush within ~10 ms;
+        // we give it 500 ms with 10 ms poll resolution. If the
+        // notify path is broken we'd be waiting on the 3 s timer
+        // and time out here.
+        let tbl_dir = config.data_directory.join(&ks).join("t");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut sstable_count = 0;
+        while std::time::Instant::now() < deadline {
+            sstable_count = std::fs::read_dir(&tbl_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.path()
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.ends_with("-Data.db"))
+                                .unwrap_or(false)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if sstable_count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            sstable_count >= 1,
+            "engine notify should have woken the watcher and produced an SSTable within 500ms; got {sstable_count}",
+        );
+
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

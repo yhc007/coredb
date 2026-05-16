@@ -41,6 +41,17 @@ pub struct QueryEngine {
     /// (CoreDB::new) should use `with_commit_log` to wire WAL durability.
     commit_log: Option<Arc<RwLock<CommitLog>>>,
     current_keyspace: Option<String>,
+    /// Optional wakeup signal for the size-threshold flush watcher.
+    /// Notified after every memtable put so a hot write workload
+    /// triggers a flush within microseconds of crossing the
+    /// threshold instead of waiting for the watcher's interval tick.
+    /// Notify::notify_one is an atomic op + one futex wake, and the
+    /// watcher coalesces multiple notifications into one scan via
+    /// the `select!`-based wakeup loop in
+    /// `CoreDB::spawn_size_threshold_watcher`. Cheap enough to fire
+    /// unconditionally; the watcher decides whether to actually
+    /// flush.
+    flush_wakeup: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl QueryEngine {
@@ -49,6 +60,7 @@ impl QueryEngine {
             keyspaces,
             commit_log: None,
             current_keyspace: None,
+            flush_wakeup: None,
         }
     }
 
@@ -65,6 +77,33 @@ impl QueryEngine {
             keyspaces,
             commit_log: Some(commit_log),
             current_keyspace: None,
+            flush_wakeup: None,
+        }
+    }
+
+    /// Attach a flush-wakeup Notify so the engine signals the
+    /// size-threshold watcher after every memtable put. Pair with
+    /// `CoreDB::spawn_size_threshold_watcher`, which holds the
+    /// other end. Without this the watcher only fires on its
+    /// interval tick (default 2 s in native_server); with it, hot
+    /// write bursts trigger a flush within microseconds of crossing
+    /// the threshold.
+    ///
+    /// Builder-style for symmetry with `with_commit_log` — callers
+    /// chain `QueryEngine::with_commit_log(...).with_flush_wakeup(...)`.
+    pub fn with_flush_wakeup(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.flush_wakeup = Some(notify);
+        self
+    }
+
+    /// Fire the flush-wakeup notify if configured. Called after
+    /// every memtable put on the engine's write paths. Cheap: one
+    /// atomic op + at most one futex wake — even on workloads that
+    /// don't have a watcher attached the `Option::is_some` check
+    /// short-circuits before any work.
+    fn signal_flush_wakeup(&self) {
+        if let Some(n) = &self.flush_wakeup {
+            n.notify_one();
         }
     }
 
@@ -594,6 +633,12 @@ impl QueryEngine {
                 message: format!("Table '{}' disappeared mid-insert", table),
             })?;
         table_struct.current_memtable.put(row)?;
+        // Drop the read locks BEFORE signalling the wakeup — the
+        // watcher needs a write lock and can't make progress while
+        // the reader (this task) is still holding theirs.
+        drop(tables);
+        drop(keyspaces);
+        self.signal_flush_wakeup();
 
         // IF NOT EXISTS 성공 시 [applied] = true 반환
         if if_not_exists {
@@ -1483,6 +1528,10 @@ impl QueryEngine {
                 message: format!("Table '{}' disappeared mid-update", table),
             })?;
         table_struct.current_memtable.put(new_row)?;
+        // Drop locks first — see insert_row for the rationale.
+        drop(tables);
+        drop(keyspaces);
+        self.signal_flush_wakeup();
 
         // IF 조건이 있었으면 [applied] = true 반환
         if if_conditions.is_some() {
@@ -1554,10 +1603,14 @@ impl QueryEngine {
                 message: format!("Table '{}' disappeared mid-delete", table),
             })?;
         table_struct.current_memtable.put(tombstone_row)?;
+        // Drop locks first — see insert_row for the rationale.
+        drop(tables);
+        drop(keyspaces);
+        self.signal_flush_wakeup();
 
         Ok(QueryResult::Success)
     }
-    
+
     /// BATCH 실행
     async fn execute_batch(&mut self, statements: Vec<CqlStatement>) -> Result<QueryResult> {
         // 모든 문장을 순서대로 실행 (INSERT, UPDATE, DELETE만 허용)
