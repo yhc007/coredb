@@ -39,15 +39,41 @@ pub struct SSTable {
     /// slow path for *that* SSTable; new memtable flushes / compactions
     /// always write the sidecar so the fleet self-heals over time.
     pub row_count: Option<u64>,
+    /// Smallest partition key in this SSTable (by `PartitionKey: Ord`).
+    /// Populated alongside `row_count` and persisted via the same
+    /// `{id}-Stats.json` sidecar (version 2). `None` for legacy
+    /// SSTables that haven't been re-opened since the v2 upgrade and
+    /// for empty SSTables (no partitions at all).
+    ///
+    /// Used by [`SSTable::read_partition`] as an O(1) range veto
+    /// before the O(log N) `partition_index` lookup, and exposed for
+    /// callers (e.g. range scans, future compaction scheduling) that
+    /// want to know an SSTable's key extent without touching disk.
+    pub min_partition_key: Option<PartitionKey>,
+    /// Largest partition key in this SSTable. Companion to
+    /// [`Self::min_partition_key`]; same lifetime, same backfill, same
+    /// veto role.
+    pub max_partition_key: Option<PartitionKey>,
 }
 
 /// Stats sidecar — `{id}-Stats.json` next to `{id}-Data.db`.
 /// Versioned so a future addition (e.g. tombstone count, per-side
 /// counts) doesn't break older readers.
+///
+/// Version log:
+/// - v1: `row_count` only.
+/// - v2: adds `min_partition_key` + `max_partition_key`. Files
+///   written by older binaries still parse via `#[serde(default)]`
+///   on the new fields, and v2 readers back-fill the bounds from
+///   the partition_index on the first re-open.
 #[derive(Serialize, Deserialize, Debug)]
 struct SSTableStats {
     version: u32,
     row_count: u64,
+    #[serde(default)]
+    min_partition_key: Option<PartitionKey>,
+    #[serde(default)]
+    max_partition_key: Option<PartitionKey>,
 }
 
 /// SSTable 헤더
@@ -197,7 +223,16 @@ impl SSTable {
         // SSTable itself is durable, and a missing sidecar just means
         // the fast path will skip this file on next load.
         let stats_file_path = base_dir.join(format!("{}-Stats.json", sstable_id));
-        let stats = SSTableStats { version: 1, row_count };
+        // partition_index is a BTreeMap → first/last keys give us the
+        // min/max bounds for free (sorted by PartitionKey: Ord).
+        let min_pk = partition_index.keys().next().cloned();
+        let max_pk = partition_index.keys().next_back().cloned();
+        let stats = SSTableStats {
+            version: 2,
+            row_count,
+            min_partition_key: min_pk.clone(),
+            max_partition_key: max_pk.clone(),
+        };
         if let Ok(stats_json) = serde_json::to_string(&stats) {
             tokio::fs::write(&stats_file_path, stats_json).await.ok();
         }
@@ -213,9 +248,11 @@ impl SSTable {
             compression: compression.clone(),
             size_bytes: total_size,
             row_count: Some(row_count),
+            min_partition_key: min_pk,
+            max_partition_key: max_pk,
         })
     }
-    
+
     /// 파티션 데이터로부터 SSTable 생성 (컴팩션용)
     pub async fn create_from_partitions(
         partitions: &std::collections::BTreeMap<PartitionKey, crate::storage::memtable::Partition>,
@@ -328,7 +365,14 @@ impl SSTable {
 
         // Stats sidecar (see create_from_memtable for rationale).
         let stats_file_path = base_dir.join(format!("{}-Stats.json", sstable_id));
-        let stats = SSTableStats { version: 1, row_count };
+        let min_pk = partition_index.keys().next().cloned();
+        let max_pk = partition_index.keys().next_back().cloned();
+        let stats = SSTableStats {
+            version: 2,
+            row_count,
+            min_partition_key: min_pk.clone(),
+            max_partition_key: max_pk.clone(),
+        };
         if let Ok(stats_json) = serde_json::to_string(&stats) {
             tokio::fs::write(&stats_file_path, stats_json).await.ok();
         }
@@ -344,9 +388,11 @@ impl SSTable {
             compression,
             size_bytes: total_size,
             row_count: Some(row_count),
+            min_partition_key: min_pk,
+            max_partition_key: max_pk,
         })
     }
-    
+
     /// 기존 SSTable 파일 열기
     pub async fn open(file_path: &std::path::Path) -> Result<Self> {
         let mut file = File::open(file_path).await?;
@@ -436,15 +482,21 @@ impl SSTable {
         let stats_file_path = file_path.with_file_name(
             file_path.file_stem().unwrap().to_string_lossy().replace("-Data", "-Stats") + ".json",
         );
-        let row_count_from_sidecar = if stats_file_path.exists() {
+        let loaded_stats: Option<SSTableStats> = if stats_file_path.exists() {
             tokio::fs::read_to_string(&stats_file_path)
                 .await
                 .ok()
                 .and_then(|s| serde_json::from_str::<SSTableStats>(&s).ok())
-                .map(|s| s.row_count)
         } else {
             None
         };
+        let row_count_from_sidecar = loaded_stats.as_ref().map(|s| s.row_count);
+        let min_pk_from_sidecar = loaded_stats
+            .as_ref()
+            .and_then(|s| s.min_partition_key.clone());
+        let max_pk_from_sidecar = loaded_stats
+            .as_ref()
+            .and_then(|s| s.max_partition_key.clone());
 
         let mut sstable = SSTable {
             id,
@@ -457,37 +509,68 @@ impl SSTable {
             compression: header.compression,
             size_bytes: metadata.len(),
             row_count: row_count_from_sidecar,
+            min_partition_key: min_pk_from_sidecar,
+            max_partition_key: max_pk_from_sidecar,
         };
 
-        if sstable.row_count.is_none() {
-            // Empty SSTable shortcuts to 0 — no partition reads.
+        // Treat the row_count and min/max bounds as a single "stats
+        // backfill" event: an SSTable that's missing either signal
+        // came from a pre-stats build (or a pre-v2 build that knew
+        // row_count but not bounds), so we regenerate the sidecar
+        // once and self-heal.
+        let needs_row_count_backfill = sstable.row_count.is_none();
+        let needs_bounds_backfill = sstable.min_partition_key.is_none()
+            && !sstable.partition_index.is_empty();
+        if needs_row_count_backfill || needs_bounds_backfill {
+            // Empty SSTable shortcuts: 0 rows, no bounds — no
+            // partition reads needed.
             if sstable.partition_index.is_empty() {
-                sstable.row_count = Some(0);
-            } else {
-                let mut total: u64 = 0;
-                let keys: Vec<PartitionKey> = sstable.partition_index.keys().cloned().collect();
-                for pk in &keys {
-                    if let Ok(Some(partition)) = sstable.read_partition(pk).await {
-                        total += partition.rows.len() as u64;
-                    }
+                if sstable.row_count.is_none() {
+                    sstable.row_count = Some(0);
                 }
-                let stats = SSTableStats { version: 1, row_count: total };
+            } else {
+                // Bounds are free from the in-memory partition_index
+                // regardless of whether row_count needs a scan.
+                if sstable.min_partition_key.is_none() {
+                    sstable.min_partition_key =
+                        sstable.partition_index.keys().next().cloned();
+                    sstable.max_partition_key =
+                        sstable.partition_index.keys().next_back().cloned();
+                }
+                if needs_row_count_backfill {
+                    let mut total: u64 = 0;
+                    let keys: Vec<PartitionKey> =
+                        sstable.partition_index.keys().cloned().collect();
+                    for pk in &keys {
+                        if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                            total += partition.rows.len() as u64;
+                        }
+                    }
+                    sstable.row_count = Some(total);
+                }
+                let stats = SSTableStats {
+                    version: 2,
+                    row_count: sstable.row_count.unwrap_or(0),
+                    min_partition_key: sstable.min_partition_key.clone(),
+                    max_partition_key: sstable.max_partition_key.clone(),
+                };
                 if let Ok(stats_json) = serde_json::to_string(&stats) {
                     if let Err(e) = tokio::fs::write(&stats_file_path, stats_json).await {
                         // Non-fatal: the sidecar will be regenerated
                         // on the next open. Just log and continue.
                         tracing::warn!(
-                            "sstable {}: stats backfill write failed ({e}); count fast path will retry next open",
+                            "sstable {}: stats backfill write failed ({e}); fast paths will retry next open",
                             sstable.id,
                         );
                     } else {
                         tracing::info!(
-                            "sstable {}: backfilled stats sidecar (row_count={total})",
+                            "sstable {}: backfilled stats sidecar (row_count={}, bounds_known={})",
                             sstable.id,
+                            sstable.row_count.unwrap_or(0),
+                            sstable.min_partition_key.is_some(),
                         );
                     }
                 }
-                sstable.row_count = Some(total);
             }
         }
 
@@ -496,6 +579,17 @@ impl SSTable {
 
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
+        // Range veto: O(1) bounds check before the O(log N)
+        // partition_index lookup. When the sidecar stored min/max
+        // bounds (v2 stats), any key outside `[min, max]` is
+        // guaranteed-absent and we don't even need to consult the
+        // BTreeMap. For legacy SSTables with no bounds known, we
+        // fall through to the index lookup unchanged.
+        if let (Some(min), Some(max)) = (&self.min_partition_key, &self.max_partition_key) {
+            if partition_key < min || partition_key > max {
+                return Ok(None);
+            }
+        }
         // Authoritative check: if the in-memory partition_index has the
         // key, the partition is in this SSTable. The bloom filter used
         // to be queried first as a fast-negative hint, but the disk
@@ -699,6 +793,147 @@ mod tests {
         }
     }
     
+    /// On create, the SSTable carries min/max partition-key bounds
+    /// derived from the sorted partition_index. The bounds survive a
+    /// close/reopen round-trip via the v2 Stats sidecar, so a daemon
+    /// restart doesn't lose the prune-fast-path.
+    #[tokio::test]
+    async fn stats_sidecar_persists_min_max_partition_key() {
+        let temp_dir = std::env::temp_dir().join("coredb_test_minmax");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let schema = create_test_schema();
+        let memtable = crate::storage::Memtable::new(schema);
+        for i in [4, 1, 3, 7, 2] {
+            memtable.put(create_test_row(i, (i * 1000) as i64, "v")).unwrap();
+        }
+        let sstable = SSTable::create_from_memtable(&memtable, &temp_dir, CompressionType::None)
+            .await
+            .unwrap();
+
+        let min_expected = PartitionKey { components: vec![CassandraValue::Int(1)] };
+        let max_expected = PartitionKey { components: vec![CassandraValue::Int(7)] };
+        assert_eq!(sstable.min_partition_key.as_ref(), Some(&min_expected));
+        assert_eq!(sstable.max_partition_key.as_ref(), Some(&max_expected));
+
+        // Reopen via SSTable::open and confirm the sidecar round-tripped.
+        let reopened = SSTable::open(&sstable.file_path).await.unwrap();
+        assert_eq!(reopened.min_partition_key.as_ref(), Some(&min_expected));
+        assert_eq!(reopened.max_partition_key.as_ref(), Some(&max_expected));
+
+        sstable.delete().await.unwrap();
+    }
+
+    /// `read_partition` short-circuits with `Ok(None)` when the
+    /// requested key is outside `[min, max]`, regardless of what
+    /// partition_index would say. Confirms the O(1) range veto is
+    /// wired in — operationally important once N SSTables stack up.
+    #[tokio::test]
+    async fn read_partition_returns_none_for_out_of_range_key() {
+        let temp_dir = std::env::temp_dir().join("coredb_test_range_veto");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let schema = create_test_schema();
+        let memtable = crate::storage::Memtable::new(schema);
+        for i in [10, 20, 30] {
+            memtable.put(create_test_row(i, (i * 1000) as i64, "v")).unwrap();
+        }
+        let sstable = SSTable::create_from_memtable(&memtable, &temp_dir, CompressionType::None)
+            .await
+            .unwrap();
+        // Sanity: bounds came back from create.
+        assert!(sstable.min_partition_key.is_some());
+        assert!(sstable.max_partition_key.is_some());
+
+        // Below the min: no partition.
+        let below = PartitionKey { components: vec![CassandraValue::Int(1)] };
+        assert!(sstable.read_partition(&below).await.unwrap().is_none());
+        // Above the max: no partition.
+        let above = PartitionKey { components: vec![CassandraValue::Int(99)] };
+        assert!(sstable.read_partition(&above).await.unwrap().is_none());
+        // Inside the range but not present (gap between 10 and 20):
+        // the partition_index lookup is still authoritative — this
+        // returns None too, just on the second branch instead of the
+        // bounds veto.
+        let gap = PartitionKey { components: vec![CassandraValue::Int(15)] };
+        assert!(sstable.read_partition(&gap).await.unwrap().is_none());
+        // Inside the range and present: returns Some.
+        let present = PartitionKey { components: vec![CassandraValue::Int(20)] };
+        assert!(sstable.read_partition(&present).await.unwrap().is_some());
+
+        sstable.delete().await.unwrap();
+    }
+
+    /// v1 Stats sidecar (row_count only, no bounds) → on reopen the
+    /// SSTable backfills both bounds from the in-memory partition_index
+    /// and rewrites the sidecar at version 2. Next open is fully
+    /// stats'd without rescanning partitions.
+    #[tokio::test]
+    async fn open_backfills_v1_sidecar_to_v2_with_bounds() {
+        let temp_dir = std::env::temp_dir().join("coredb_test_v1_backfill");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+        }
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let schema = create_test_schema();
+        let memtable = crate::storage::Memtable::new(schema);
+        for i in [5, 6, 8] {
+            memtable.put(create_test_row(i, (i * 1000) as i64, "v")).unwrap();
+        }
+        let sstable = SSTable::create_from_memtable(&memtable, &temp_dir, CompressionType::None)
+            .await
+            .unwrap();
+
+        // Simulate a pre-v2 sidecar on disk: rewrite the Stats.json
+        // with version 1 + row_count, no bounds. Older binaries that
+        // ran before this commit would have written exactly this
+        // shape.
+        let stats_path = sstable.file_path.with_file_name(
+            sstable
+                .file_path
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .replace("-Data", "-Stats")
+                + ".json",
+        );
+        let v1_json = serde_json::json!({
+            "version": 1,
+            "row_count": 3,
+        })
+        .to_string();
+        tokio::fs::write(&stats_path, v1_json).await.unwrap();
+
+        let reopened = SSTable::open(&sstable.file_path).await.unwrap();
+        // Bounds got backfilled from partition_index, not lost.
+        assert_eq!(
+            reopened.min_partition_key,
+            Some(PartitionKey { components: vec![CassandraValue::Int(5)] }),
+        );
+        assert_eq!(
+            reopened.max_partition_key,
+            Some(PartitionKey { components: vec![CassandraValue::Int(8)] }),
+        );
+
+        // And the sidecar on disk was rewritten as v2 with bounds.
+        let rewritten: SSTableStats = serde_json::from_str(
+            &tokio::fs::read_to_string(&stats_path).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rewritten.version, 2);
+        assert!(rewritten.min_partition_key.is_some());
+        assert!(rewritten.max_partition_key.is_some());
+
+        sstable.delete().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_sstable_creation_and_read() {
         let temp_dir = std::env::temp_dir().join("coredb_test");
