@@ -816,31 +816,80 @@ impl QueryEngine {
                     }
                 }
             } else {
-                // 전체 스캔
+                // 전체 스캔.
+                //
+                // Early-termination guard: when the caller has set
+                // a LIMIT and the rest of the query doesn't need a
+                // full materialization (no WHERE filter, no
+                // ORDER BY, no aggregation / GROUP BY / DISTINCT),
+                // we can stop reading sources once we've gathered
+                // enough rows to satisfy the LIMIT. With a 2× safety
+                // factor for any dedup that the post-scan dedup_map
+                // will perform — the floor-of-2 keeps `LIMIT 1`
+                // honest while still trimming for large N.
+                //
+                // SSTable iteration is the part that actually
+                // benefits — memtable scans are in-memory anyway,
+                // but stopping there too keeps the contract uniform:
+                // once we have enough, stop. For tables with cross-
+                // source duplicates this may still return fewer than
+                // LIMIT rows (the dedup reduces the count); operators
+                // who want exactly N back can bump LIMIT to 2N.
+                let can_short_circuit = limit.is_some()
+                    && where_clause.is_none()
+                    && order_by.is_none()
+                    && aggregations.is_empty()
+                    && group_by.is_empty()
+                    && !distinct;
+                // Use the safety factor only when limit can actually
+                // be hit; otherwise the scan is unbounded.
+                let scan_cap: usize = if can_short_circuit {
+                    let l = limit.unwrap() as usize;
+                    l.saturating_mul(2).max(2)
+                } else {
+                    usize::MAX
+                };
+
                 // 1. Current Memtable
                 let partitions = table_struct.current_memtable.get_all_partitions();
-                for (_, partition) in partitions {
+                'mem_current: for (_, partition) in partitions {
                     for entry in partition.rows.iter() {
                         result_rows.push(entry.value().clone());
-                    }
-                }
-
-                // 2. Immutable Memtables
-                for memtable in &table_struct.memtables {
-                    let partitions = memtable.get_all_partitions();
-                    for (_, partition) in partitions {
-                        for entry in partition.rows.iter() {
-                            result_rows.push(entry.value().clone());
+                        if result_rows.len() >= scan_cap {
+                            break 'mem_current;
                         }
                     }
                 }
 
-                // 3. SSTables - full scan
-                for sstable in &table_struct.sstables {
-                    for pk in sstable.partition_index.keys() {
-                        if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                // 2. Immutable Memtables
+                if result_rows.len() < scan_cap {
+                    'mem_immut: for memtable in &table_struct.memtables {
+                        let partitions = memtable.get_all_partitions();
+                        for (_, partition) in partitions {
                             for entry in partition.rows.iter() {
                                 result_rows.push(entry.value().clone());
+                                if result_rows.len() >= scan_cap {
+                                    break 'mem_immut;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. SSTables - full scan. This is the hot loop the
+                // optimization is built for: a table with thousands
+                // of bucket-keyed SSTables would otherwise pay
+                // O(rows) for a LIMIT 20 query.
+                if result_rows.len() < scan_cap {
+                    'sstable_scan: for sstable in &table_struct.sstables {
+                        for pk in sstable.partition_index.keys() {
+                            if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                                for entry in partition.rows.iter() {
+                                    result_rows.push(entry.value().clone());
+                                    if result_rows.len() >= scan_cap {
+                                        break 'sstable_scan;
+                                    }
+                                }
                             }
                         }
                     }

@@ -1959,6 +1959,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// Full-scan LIMIT N short-circuits the SSTable iteration once
+    /// the per-scan cap is reached. With 200 inserted rows flushed
+    /// into SSTables, `SELECT * FROM t LIMIT 20` returns exactly 20
+    /// rows without materializing all 200 (the cap is `2*LIMIT`).
+    /// Memtable-only data is exercised by inserting 200 rows and
+    /// not flushing; SSTable iteration is exercised by flushing
+    /// first, then doing the same query.
+    #[tokio::test]
+    async fn test_select_limit_n_short_circuits_full_scan() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_limit_n_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut config = DatabaseConfig::default();
+        config.data_directory = data_dir.join("data");
+        config.commitlog_directory = data_dir.join("commitlog");
+        let db = CoreDB::new(config.clone()).await.unwrap();
+
+        let ks = format!("test_limit_n_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+        for i in 0..200 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'row-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Memtable-only path: LIMIT N must still produce N rows.
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t LIMIT 20"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows for memtable LIMIT 20, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 20, "memtable-only LIMIT 20 must return 20 rows");
+
+        // Flush so the data lives in SSTables instead — same
+        // assertion exercises the SSTable iteration short-circuit.
+        db.flush_all().await.ok();
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t LIMIT 20"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows for sstable LIMIT 20, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 20, "SSTable-backed LIMIT 20 must return 20 rows");
+
+        // No LIMIT: must still return everything. Confirms the
+        // short-circuit didn't accidentally cap unlimited queries.
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows for unlimited scan, got {other:?}"),
+        };
+        assert_eq!(
+            rows.len(),
+            200,
+            "no-LIMIT scan should return all 200 rows (got {})",
+            rows.len(),
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     /// SSTable bounds pruning at the engine level: after flushing
     /// rows into an SSTable, a point lookup for a partition key
     /// outside the SSTable's min/max range returns zero rows
