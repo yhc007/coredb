@@ -1814,7 +1814,7 @@ mod tests {
         assert!(stats.table_count >= 1);
     }
     
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cql_execution() {
         let config = DatabaseConfig::default();
         let db = CoreDB::new(config).await.unwrap();
@@ -1846,7 +1846,7 @@ mod tests {
     /// testable in a unit test cheaply — the structural guarantee
     /// (one row out, no crash, no missing data) is the contract we
     /// lock in here.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_select_limit_1_returns_one_row() {
         use crate::query::QueryResult;
 
@@ -1887,7 +1887,7 @@ mod tests {
         assert!(row.columns.contains_key("name"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_select_limit_1_empty_table() {
         use crate::query::QueryResult;
 
@@ -1919,7 +1919,7 @@ mod tests {
     /// return the correct count via the engine's fast path, summing
     /// memtable + SSTable row_count. With no SSTables yet (only
     /// memtable), the memtable row count alone must drive the answer.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_count_star_fast_path_memtable_only() {
         use crate::query::QueryResult;
         use crate::schema::CassandraValue;
@@ -1972,7 +1972,7 @@ mod tests {
     /// sidecar), then delete the sidecar to simulate a pre-fix
     /// SSTable. Reopen the DB at the same data dir and verify the
     /// sidecar was regenerated with the original row count.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_legacy_sstable_stats_backfilled_on_open() {
         // Pick a unique data dir so parallel tests don't collide.
         let data_dir = std::env::temp_dir().join(format!(
@@ -2174,7 +2174,7 @@ mod tests {
     /// call. Threshold is set to 0 MB to force every non-empty
     /// memtable past the line — simpler than calibrating bytes
     /// against the schema's serialized form.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn check_memtable_flush_only_rotates_over_threshold() {
         let data_dir = std::env::temp_dir().join(format!(
             "coredb_threshold_test_{}",
@@ -2311,7 +2311,7 @@ mod tests {
     /// timing would force them to be serialized after the flush.
     /// The new code lets them interleave; the assertion is just
     /// "all rows present", which is the durable contract either way.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_memtable_rotates_for_concurrent_writes() {
         let data_dir = std::env::temp_dir().join(format!(
             "coredb_flush_rotate_test_{}",
@@ -2402,7 +2402,7 @@ mod tests {
     /// dictated by Vec insertion order (which would have surfaced
     /// the second-flushed SSTable's higher ids when its
     /// min_partition_key wasn't being consulted).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_select_limit_n_iterates_sstables_in_min_pk_order() {
         let data_dir = std::env::temp_dir().join(format!(
             "coredb_sst_order_test_{}",
@@ -2488,7 +2488,7 @@ mod tests {
     /// Memtable-only data is exercised by inserting 200 rows and
     /// not flushing; SSTable iteration is exercised by flushing
     /// first, then doing the same query.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_select_limit_n_short_circuits_full_scan() {
         let data_dir = std::env::temp_dir().join(format!(
             "coredb_limit_n_test_{}",
@@ -2573,7 +2573,7 @@ mod tests {
     /// correctness side: vetoing the SSTable must not lose data
     /// from any other source (memtable, other SSTables) and must
     /// not erroneously veto in-range keys.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_select_with_partition_key_outside_sstable_bounds() {
         let data_dir = std::env::temp_dir().join(format!(
             "coredb_engine_prune_test_{}",
@@ -2655,7 +2655,7 @@ mod tests {
     /// physical layout has the same partition key in two places.
     /// COUNT(*) must return 1 (slow-path dedup), not 2 (fast-path
     /// sum).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_count_star_bails_when_partition_overlaps() {
         use crate::query::QueryResult;
         use crate::schema::CassandraValue;
@@ -2718,7 +2718,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_count_star_fast_path_empty_table() {
         use crate::query::QueryResult;
         use crate::schema::CassandraValue;
@@ -2764,7 +2764,7 @@ mod tests {
     /// missing from the DB data but are required by the Rust type".
     /// The fix synthesizes `CassandraValue::Null` for the absent cell
     /// so the column slot is always present on the wire.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_select_projects_post_alter_column_as_null_for_pre_alter_rows() {
         use crate::query::QueryResult;
         use crate::schema::CassandraValue;
