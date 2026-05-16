@@ -1,5 +1,5 @@
 use crate::schema::{TableSchema, PartitionKey, ClusteringKey, CassandraValue, Row as SchemaRow, Cell};
-use crate::storage::Memtable;
+use crate::storage::{Memtable, SSTable};
 use crate::query::{CqlStatement, QueryResult, Row as QueryRow};
 use crate::wal::{CommitLog, CommitLogEntry, Mutation};
 use crate::error::*;
@@ -880,8 +880,34 @@ impl QueryEngine {
                 // optimization is built for: a table with thousands
                 // of bucket-keyed SSTables would otherwise pay
                 // O(rows) for a LIMIT 20 query.
+                //
+                // Iterate SSTables in ascending `min_partition_key`
+                // order so a `LIMIT N` over a full scan returns the
+                // smallest-key partitions first, deterministically.
+                // Without this the order is dictated by the Vec's
+                // insertion order — which depends on flush timing,
+                // compaction, and restart-load order. Two runs of
+                // the same `SELECT * FROM t LIMIT N` could surface
+                // different rows; sorting the iteration view (not
+                // the underlying Vec) gives operators a stable
+                // result for ad-hoc queries.
+                //
+                // SSTables with unknown bounds (legacy v1 sidecar)
+                // sort last — they're the only ones that need to
+                // open data to know their key extent, and we'd
+                // rather satisfy LIMIT from bounds-known SSTables
+                // first when we can.
                 if result_rows.len() < scan_cap {
-                    'sstable_scan: for sstable in &table_struct.sstables {
+                    let mut sstable_order: Vec<&Arc<SSTable>> = table_struct.sstables.iter().collect();
+                    sstable_order.sort_by(|a, b| {
+                        match (&a.min_partition_key, &b.min_partition_key) {
+                            (Some(ak), Some(bk)) => ak.cmp(bk),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                    'sstable_scan: for sstable in &sstable_order {
                         for pk in sstable.partition_index.keys() {
                             if let Ok(Some(partition)) = sstable.read_partition(pk).await {
                                 for entry in partition.rows.iter() {

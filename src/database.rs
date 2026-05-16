@@ -1959,6 +1959,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// Full-scan `LIMIT N` returns the smallest-key partitions
+    /// regardless of which SSTable was flushed first. Insert two
+    /// groups of rows separated by an explicit flush so the data
+    /// lives in two distinct SSTables, then assert the LIMIT-2
+    /// result is the lowest two ids — `[0, 1]` — instead of being
+    /// dictated by Vec insertion order (which would have surfaced
+    /// the second-flushed SSTable's higher ids when its
+    /// min_partition_key wasn't being consulted).
+    #[tokio::test]
+    async fn test_select_limit_n_iterates_sstables_in_min_pk_order() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "coredb_sst_order_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut config = DatabaseConfig::default();
+        config.data_directory = data_dir.join("data");
+        config.commitlog_directory = data_dir.join("commitlog");
+        let db = CoreDB::new(config.clone()).await.unwrap();
+
+        let ks = format!("test_sst_order_ks_{}", std::process::id());
+        db.execute_cql(&format!(
+            "CREATE KEYSPACE {ks} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap();
+        db.execute_cql(&format!(
+            "CREATE TABLE {ks}.t (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .unwrap();
+
+        // Flush 100..200 first so the SSTable with higher keys is
+        // inserted into the Vec first — without min_pk ordering,
+        // the iteration would surface those ids before the lower
+        // group flushed second.
+        for i in 100..200 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'hi-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+        db.flush_all().await.ok();
+
+        for i in 0..100 {
+            db.execute_cql(&format!(
+                "INSERT INTO {ks}.t (id, name) VALUES ({i}, 'lo-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+        db.flush_all().await.ok();
+
+        // LIMIT 2 over a full scan: must surface the two lowest
+        // ids (0 and 1) because they live in the lower-min_pk
+        // SSTable, which the iteration now visits first.
+        let result = db
+            .execute_cql(&format!("SELECT * FROM {ks}.t LIMIT 2"))
+            .await
+            .unwrap();
+        let rows = match &result {
+            crate::query::QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 2, "LIMIT 2 should return 2 rows, got {}", rows.len());
+
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r.columns.get("id") {
+                Some(crate::schema::CassandraValue::Int(n)) => *n as i64,
+                Some(crate::schema::CassandraValue::BigInt(n)) => *n,
+                other => panic!("unexpected id type: {other:?}"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "LIMIT 2 over min_pk-ordered iteration should return the two lowest ids, got {ids:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     /// Full-scan LIMIT N short-circuits the SSTable iteration once
     /// the per-scan cap is reached. With 200 inserted rows flushed
     /// into SSTables, `SELECT * FROM t LIMIT 20` returns exactly 20
