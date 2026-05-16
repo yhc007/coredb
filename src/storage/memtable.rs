@@ -120,6 +120,22 @@ impl Memtable {
         }
     }
     
+    /// Smallest partition key currently in this memtable, or `None`
+    /// when the memtable is empty. O(1) on the underlying SkipMap
+    /// (sorted iteration order). Used by the query engine to sort
+    /// immutable memtables by their key extent before a full scan —
+    /// gives a `LIMIT N` query the same min-pk-first ordering as
+    /// the SSTable iteration so the result stays deterministic
+    /// regardless of which memtable was rotated in first.
+    pub fn first_partition_key(&self) -> Option<PartitionKey> {
+        self.partitions.iter().next().map(|e| e.key().clone())
+    }
+
+    #[cfg(test)]
+    pub fn partition_keys_ordered(&self) -> Vec<PartitionKey> {
+        self.partitions.iter().map(|e| e.key().clone()).collect()
+    }
+
     pub fn get_all_partitions(&self) -> Vec<(PartitionKey, Partition)> {
         self.partitions.iter()
             .map(|entry| {
@@ -271,6 +287,45 @@ mod tests {
         }
     }
     
+    /// Memtable's `partitions` is a SkipMap, so `iter()` walks keys
+    /// in sorted order. Pin that invariant explicitly so a future
+    /// refactor (e.g. swapping in a HashMap for an "unrelated"
+    /// reason) doesn't silently break the engine's deterministic
+    /// LIMIT contract.
+    #[test]
+    fn partition_iteration_is_partition_key_sorted() {
+        let schema = create_test_schema();
+        let memtable = Memtable::new(schema);
+        // Insert out-of-order so iteration order isn't just
+        // insertion-order coincidence.
+        for id in [7, 1, 5, 3, 9, 2] {
+            memtable.put(create_test_row(id, (id * 1000) as i64, "v")).unwrap();
+        }
+        let keys = memtable.partition_keys_ordered();
+        let mut expected: Vec<_> = [1, 2, 3, 5, 7, 9]
+            .iter()
+            .map(|id| PartitionKey { components: vec![CassandraValue::Int(*id)] })
+            .collect();
+        expected.sort();
+        assert_eq!(keys, expected, "memtable.partitions must iterate in PK-sorted order");
+    }
+
+    #[test]
+    fn first_partition_key_smallest_when_populated_none_when_empty() {
+        let schema = create_test_schema();
+        let memtable = Memtable::new(schema.clone());
+        assert!(memtable.first_partition_key().is_none(), "empty memtable: None");
+
+        for id in [50, 10, 30] {
+            memtable.put(create_test_row(id, 1, "v")).unwrap();
+        }
+        assert_eq!(
+            memtable.first_partition_key(),
+            Some(PartitionKey { components: vec![CassandraValue::Int(10)] }),
+            "populated memtable: smallest pk",
+        );
+    }
+
     #[test]
     fn test_memtable_put_and_get() {
         let schema = create_test_schema();

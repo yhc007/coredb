@@ -861,9 +861,28 @@ impl QueryEngine {
                     }
                 }
 
-                // 2. Immutable Memtables
+                // 2. Immutable Memtables. Same min-pk ordering as
+                // the SSTable iteration below — each memtable's
+                // SkipMap is internally sorted, but the order
+                // across multiple immutable memtables is Vec-order
+                // (insertion / rotation order). Sorting the
+                // iteration view by each memtable's smallest
+                // partition key makes a `LIMIT N` query
+                // deterministic across the immutable layer too.
+                // Empty memtables sort last via `first_partition_key`
+                // returning None.
                 if result_rows.len() < scan_cap {
-                    'mem_immut: for memtable in &table_struct.memtables {
+                    let mut mem_order: Vec<&Arc<Memtable>> =
+                        table_struct.memtables.iter().collect();
+                    mem_order.sort_by(|a, b| {
+                        match (a.first_partition_key(), b.first_partition_key()) {
+                            (Some(ak), Some(bk)) => ak.cmp(&bk),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                    'mem_immut: for memtable in &mem_order {
                         let partitions = memtable.get_all_partitions();
                         for (_, partition) in partitions {
                             for entry in partition.rows.iter() {
