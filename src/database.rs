@@ -375,6 +375,19 @@ impl CoreDB {
         } else {
             None
         };
+
+        // ALTER TABLE 인 경우 스키마 재저장이 필요. ALTER TABLE handling
+        // happens inside the engine — it mutates the in-memory Arc<TableSchema>
+        // — but nothing currently persists that mutation. Without this hook,
+        // `ALTER TABLE ... ADD col` succeeds at runtime but the column is
+        // gone after the next restart (load_existing_data reads the stale
+        // schema.json from disk). Capture (keyspace, table) here, then re-
+        // serialize the post-engine schema below.
+        let alter_table_info = if let CqlStatement::AlterTable { ref keyspace, ref table, .. } = parsed {
+            Some((keyspace.clone(), table.clone()))
+        } else {
+            None
+        };
         
         // INSERT 시 인덱스 업데이트 정보 추출
         let insert_info = if let CqlStatement::Insert { ref keyspace, ref table, ref values, ref ttl, .. } = parsed {
@@ -392,6 +405,29 @@ impl CoreDB {
         let mut engine = self.query_engine.write().await;
         let result = engine.execute(parsed).await?;
         
+        // ALTER TABLE 성공 후 schema.json 재저장. The engine has
+        // already mutated `tbl.schema` (cloned Arc swap); we just
+        // need to re-serialize that to disk so load_existing_data
+        // picks up the change on next startup. Read the
+        // post-engine schema fresh from the keyspaces map to
+        // avoid reconstructing it from the parsed statement.
+        if let Some((keyspace, table_name)) = alter_table_info {
+            if matches!(result, QueryResult::Success) {
+                let schema_to_save: Option<TableSchema> = {
+                    let kss = self.keyspaces.read().await;
+                    if let Some(ks) = kss.get(&keyspace) {
+                        let tables = ks.tables.read().await;
+                        tables.get(&table_name).map(|t| (*t.schema).clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(schema) = schema_to_save {
+                    self.save_table_schema(&keyspace, &table_name, &schema).await?;
+                }
+            }
+        }
+
         // CREATE TABLE 성공 후 스키마 저장
         if let Some((keyspace, table_name, columns, partition_key, clustering_key)) = create_table_info {
             if matches!(result, QueryResult::Success) {
@@ -2826,5 +2862,110 @@ mod tests {
             "expected NULL for pre-ALTER row's `strategy`, got {:?}",
             row.columns.get("strategy")
         );
+    }
+
+    /// Regression: a column added via `ALTER TABLE ... ADD col` must
+    /// be present after a CoreDB restart. Before the fix, alter_table
+    /// mutated the in-memory `Arc<TableSchema>` but never re-wrote
+    /// schema.json on disk — so load_existing_data at the next
+    /// startup read the *pre-ALTER* schema and INSERTs targeting the
+    /// added column failed with "Column 'X' does not exist".
+    ///
+    /// The fix is in `execute_cql`: after the engine reports
+    /// AlterTable success, the CoreDB layer re-serializes the now-
+    /// mutated schema via `save_table_schema`. This test creates a
+    /// table, ALTERs it, drops the live instance, opens a new CoreDB
+    /// pointed at the same data directory, and confirms the
+    /// post-ALTER column is loaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_alter_table_add_column_survives_restart() {
+        use crate::query::QueryResult;
+        use crate::schema::CassandraValue;
+
+        // Two CoreDB sessions pointing at the same data directory.
+        // Use a unique subdirectory so concurrent test runs don't
+        // collide on disk.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().join("data");
+        let commitlog_dir = tmp.path().join("commitlog");
+        let config = DatabaseConfig {
+            data_directory: data_dir.clone(),
+            commitlog_directory: commitlog_dir.clone(),
+            ..DatabaseConfig::default()
+        };
+
+        let ks_name = format!("test_alter_persist_ks_{}", std::process::id());
+
+        // Session 1: create, alter, insert a row that uses the new column.
+        {
+            let db = CoreDB::new(config.clone()).await.unwrap();
+            db.execute_cql(&format!(
+                "CREATE KEYSPACE {ks_name} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .unwrap();
+            db.execute_cql(&format!(
+                "CREATE TABLE {ks_name}.t (id INT PRIMARY KEY, name TEXT)"
+            ))
+            .await
+            .unwrap();
+            let alter = db
+                .execute_cql(&format!("ALTER TABLE {ks_name}.t ADD strategy TEXT"))
+                .await
+                .unwrap();
+            assert!(alter.is_success(), "session 1: ALTER TABLE failed");
+            // Sanity: insert against the new column should work in
+            // the SAME session even without persistence (engine has
+            // the updated in-memory schema).
+            db.execute_cql(&format!(
+                "INSERT INTO {ks_name}.t (id, name, strategy) VALUES (1, 'pre', 'baseline')"
+            ))
+            .await
+            .unwrap();
+            // Drop session 1 — `db` goes out of scope. The fix
+            // ensures the post-ALTER schema is now on disk in
+            // schema.json before this drop.
+        }
+
+        // Session 2: fresh CoreDB pointed at the same dir. If the
+        // ALTER was persisted, load_existing_data picks up the
+        // 3-column schema; INSERT against `strategy` succeeds.
+        {
+            let db = CoreDB::new(config.clone()).await.unwrap();
+            let insert_result = db
+                .execute_cql(&format!(
+                    "INSERT INTO {ks_name}.t (id, name, strategy) VALUES (2, 'post-restart', 'deepseek')"
+                ))
+                .await;
+            assert!(
+                insert_result.is_ok(),
+                "regression: INSERT against post-ALTER column failed after restart; \
+                 schema.json wasn't re-saved by ALTER TABLE. error: {:?}",
+                insert_result.err()
+            );
+
+            // Read back to confirm the column actually carried the
+            // value, not just got accepted by the parser.
+            let read = db
+                .execute_cql(&format!(
+                    "SELECT id, name, strategy FROM {ks_name}.t WHERE id = 2"
+                ))
+                .await
+                .unwrap();
+            let rows = match read {
+                QueryResult::Rows(r) => r,
+                other => panic!("expected Rows, got {other:?}"),
+            };
+            assert_eq!(rows.len(), 1, "expected exactly one row");
+            let row = &rows[0];
+            assert!(
+                matches!(
+                    row.columns.get("strategy"),
+                    Some(CassandraValue::Text(s)) if s == "deepseek"
+                ),
+                "strategy column missing or wrong value after restart: {:?}",
+                row.columns.get("strategy")
+            );
+        }
     }
 }
