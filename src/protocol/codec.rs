@@ -426,6 +426,30 @@ fn encode_rows_metadata(buf: &mut BytesMut, metadata: &RowsMetadata) {
             }
             write_string(buf, &col.name);
             write_short(buf, col.col_type as u16);
+            // Cassandra v4 protocol: Set/List columns have their
+            // element type appended as a second [option]. Map has
+            // both key and value types. Without these, drivers that
+            // type-check the column metadata against their target
+            // Rust struct (scylla-rust-driver does this) reject the
+            // response with "neither a set nor a list".
+            //
+            // We default to Varchar (text) element type — that's
+            // what the system-table intercept needs (tokens =
+            // set<text>, field_names/field_types = list<text>), and
+            // CoreDB's existing collection-value encoding stringifies
+            // collection contents anyway, so Varchar is the most
+            // honest declared type. Per-column inner-type tracking
+            // would be cleaner but is out of scope here.
+            match col.col_type {
+                CqlType::Set | CqlType::List => {
+                    write_short(buf, CqlType::Varchar as u16);
+                }
+                CqlType::Map => {
+                    write_short(buf, CqlType::Varchar as u16);
+                    write_short(buf, CqlType::Varchar as u16);
+                }
+                _ => {}
+            }
         }
     }
 }
