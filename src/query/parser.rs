@@ -467,7 +467,9 @@ impl CqlParser {
     
     fn parse_insert(query: &str) -> Result<CqlStatement> {
         // INSERT 파싱 (USING TTL + IF NOT EXISTS 지원)
-        let re = regex::Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+?)\)(?:\s+USING\s+TTL\s+(\d+))?(?:\s+IF\s+NOT\s+EXISTS)?\s*;?\s*$")?;
+        // `(?is)`: `s` (dotall) lets `.` match newlines so quoted values that
+        // contain `\n` (e.g. multi-line conversation memories) parse correctly.
+        let re = regex::Regex::new(r"(?is)INSERT\s+INTO\s+(\w+)\.(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+?)\)(?:\s+USING\s+TTL\s+(\d+))?(?:\s+IF\s+NOT\s+EXISTS)?\s*;?\s*$")?;
         
         // IF NOT EXISTS 체크
         let if_not_exists = query.to_uppercase().contains("IF NOT EXISTS");
@@ -507,7 +509,7 @@ impl CqlParser {
             })
         }
     }
-    
+
     /// Split VALUES by comma, but respect quoted strings
     fn split_values_respecting_quotes(s: &str) -> Vec<String> {
         let mut values = Vec::new();
@@ -654,7 +656,8 @@ impl CqlParser {
     
     fn parse_update(query: &str) -> Result<CqlStatement> {
         // UPDATE keyspace.table SET col1 = val1, col2 = col2 + 1 WHERE pk = x [IF condition]
-        let re = regex::Regex::new(r"(?i)UPDATE\s+(\w+)\.(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+?)(?:\s+IF\s+(.+?))?\s*;?\s*$")?;
+        // `(?is)`: dotall so SET values containing newlines parse (see INSERT).
+        let re = regex::Regex::new(r"(?is)UPDATE\s+(\w+)\.(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+?)(?:\s+IF\s+(.+?))?\s*;?\s*$")?;
         
         if let Some(caps) = re.captures(query) {
             let keyspace = caps.get(1).unwrap().as_str().to_string();
