@@ -400,17 +400,19 @@ impl SSTable {
     
     /// 파티션 읽기
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
-        // 1. 블룸 필터 체크 (빠른 음성 응답)
-        if !self.bloom_filter.might_contain(partition_key) {
-            return Ok(None);
-        }
-        
-        // 2. 파티션 인덱스에서 오프셋 찾기
+        // 1. 파티션 인덱스에서 오프셋 찾기.
+        //    인메모리 파티션 인덱스가 존재 여부의 권위적 출처다. 인덱스에 키가 있으면
+        //    블룸 필터가 음성이어도(예: -Bloom.db 역직렬화 실패로 빈 필터로 폴백된 경우)
+        //    실재하는 파티션이므로 반드시 읽는다. 블룸 필터를 인덱스보다 먼저 검사하면
+        //    재시작 시 SSTable 데이터를 로드하지 못하는 영속성 버그가 발생한다.
         let offset = match self.partition_index.get(partition_key) {
             Some(offset) => *offset,
-            None => return Ok(None),
+            None => {
+                // 인덱스에 없을 때만 블룸 필터로 음성 확인(여기서는 항상 부재).
+                return Ok(None);
+            }
         };
-        
+
         // 3. 디스크에서 파티션 데이터 읽기
         let mut file = File::open(&self.file_path).await?;
         file.seek(SeekFrom::Start(offset)).await?;
