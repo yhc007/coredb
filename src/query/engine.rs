@@ -719,17 +719,15 @@ impl QueryEngine {
                 let mut seen: HashSet<crate::schema::PartitionKey> = HashSet::new();
                 let mut clean = true;
                 'check: {
-                    let parts = table_struct.current_memtable.get_all_partitions();
-                    for (pk, _) in &parts {
-                        if !seen.insert(pk.clone()) {
+                    for pk in table_struct.current_memtable.partition_keys() {
+                        if !seen.insert(pk) {
                             clean = false;
                             break 'check;
                         }
                     }
                     for mt in &table_struct.memtables {
-                        let parts = mt.get_all_partitions();
-                        for (pk, _) in &parts {
-                            if !seen.insert(pk.clone()) {
+                        for pk in mt.partition_keys() {
+                            if !seen.insert(pk) {
                                 clean = false;
                                 break 'check;
                             }
@@ -787,47 +785,38 @@ impl QueryEngine {
 
         let mut result_rows: Vec<SchemaRow> = Vec::new();
 
+        // 메모리에 한 행이라도 있으면 거기서 끝난다. 없으면 일반 경로로 넘긴다.
+        //
+        // 예전에는 여기서 SSTable 첫 파티션까지 직접 읽었는데, 그 파티션이
+        // 크면 일반 스캔보다 오히려 느렸다 (실측 LIMIT 1이 44초, 같은 데이터에서
+        // LIMIT 10은 0.01초). 일반 경로는 `scan_cap`으로 이미 조기 종료하므로
+        // SSTable은 그쪽에 맡기는 편이 빠르고 코드도 하나로 준다.
+        let mut fast_path_hit = false;
+
         if fast_path_eligible {
             'fast: {
                 // 1. Current memtable.
-                let parts = table_struct.current_memtable.get_all_partitions();
-                for (_, partition) in parts {
-                    if let Some(entry) = partition.rows.iter().next() {
-                        result_rows.push(entry.value().clone());
-                        break 'fast;
-                    }
+                if let Some(row) = table_struct.current_memtable.first_row() {
+                    result_rows.push(row);
+                    fast_path_hit = true;
+                    break 'fast;
                 }
                 // 2. Immutable memtables.
                 for mt in &table_struct.memtables {
-                    let parts = mt.get_all_partitions();
-                    for (_, partition) in parts {
-                        if let Some(entry) = partition.rows.iter().next() {
-                            result_rows.push(entry.value().clone());
-                            break 'fast;
-                        }
+                    if let Some(row) = mt.first_row() {
+                        result_rows.push(row);
+                        fast_path_hit = true;
+                        break 'fast;
                     }
                 }
-                // 3. SSTables — read the very first partition only.
-                for sstable in &table_struct.sstables {
-                    if let Some(first_pk) = sstable.partition_index.keys().next() {
-                        if let Ok(Some(partition)) = sstable.read_partition(first_pk).await {
-                            if let Some(entry) = partition.rows.iter().next() {
-                                result_rows.push(entry.value().clone());
-                                break 'fast;
-                            }
-                        }
-                    }
-                }
-                // Table genuinely empty — leave result_rows empty
-                // and fall through to the regular post-processing
-                // tail which handles that case cleanly.
+                // 메모리에 없음 — SSTable은 아래 일반 경로가 처리한다.
             }
         }
         
         // Skip the regular scan path if the fast path already
         // populated `result_rows` with a single row (or definitively
         // proved the table empty).
-        if !fast_path_eligible {
+        if !fast_path_hit {
             if let Some(pk) = partition_key {
                 // 1. Memtable 검색
                 let rows = table_struct.current_memtable.range_scan(&pk, &None, &None);
@@ -896,15 +885,10 @@ impl QueryEngine {
                 };
 
                 // 1. Current Memtable
-                let partitions = table_struct.current_memtable.get_all_partitions();
-                'mem_current: for (_, partition) in partitions {
-                    for entry in partition.rows.iter() {
-                        result_rows.push(entry.value().clone());
-                        if result_rows.len() >= scan_cap {
-                            break 'mem_current;
-                        }
-                    }
-                }
+                table_struct.current_memtable.for_each_row(|row| {
+                    result_rows.push(row.clone());
+                    result_rows.len() < scan_cap
+                });
 
                 // 2. Immutable Memtables. Same min-pk ordering as
                 // the SSTable iteration below — each memtable's
@@ -927,16 +911,14 @@ impl QueryEngine {
                             (None, None) => std::cmp::Ordering::Equal,
                         }
                     });
-                    'mem_immut: for memtable in &mem_order {
-                        let partitions = memtable.get_all_partitions();
-                        for (_, partition) in partitions {
-                            for entry in partition.rows.iter() {
-                                result_rows.push(entry.value().clone());
-                                if result_rows.len() >= scan_cap {
-                                    break 'mem_immut;
-                                }
-                            }
+                    for memtable in &mem_order {
+                        if result_rows.len() >= scan_cap {
+                            break;
                         }
+                        memtable.for_each_row(|row| {
+                            result_rows.push(row.clone());
+                            result_rows.len() < scan_cap
+                        });
                     }
                 }
 

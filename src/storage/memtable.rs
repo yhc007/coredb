@@ -136,6 +136,43 @@ impl Memtable {
         self.partitions.iter().map(|e| e.key().clone()).collect()
     }
 
+    /// 파티션 키만 훑는다. 행은 건드리지 않는다.
+    ///
+    /// COUNT(*) 중복 검사처럼 키만 필요한 자리에서 `get_all_partitions`를 쓰면
+    /// 쓰지도 않을 행을 전부 복제하게 된다.
+    pub fn partition_keys(&self) -> Vec<PartitionKey> {
+        self.partitions.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// 가장 앞 파티션에서 첫 행 하나. 없으면 None.
+    ///
+    /// `LIMIT 1` 질의용. 한 행만 필요한데 `get_all_partitions`를 부르면
+    /// 테이블 전체를 복제한 뒤 그중 하나를 버리지 않고 꺼내는 꼴이 된다.
+    pub fn first_row(&self) -> Option<Row> {
+        for entry in self.partitions.iter() {
+            if let Some(row) = entry.value().rows.iter().next() {
+                return Some(row.value().clone());
+            }
+        }
+        None
+    }
+
+    /// 복제 없이 전 행을 순서대로 넘긴다. 콜백이 `false`를 주면 즉시 멈춘다.
+    ///
+    /// 순회 순서는 `get_all_partitions` 결과를 훑는 것과 같다 — 둘 다 SkipMap
+    /// 순서(파티션 키, 그 안에서 클러스터링 키)를 따른다. 다른 점은 여기서는
+    /// 중간에 멈출 수 있다는 것뿐이다. LIMIT이 걸린 질의가 테이블 전체를 먼저
+    /// 복제하고 나서야 조기 종료를 판단하던 문제를 없앤다.
+    pub fn for_each_row<F: FnMut(&Row) -> bool>(&self, mut f: F) {
+        for entry in self.partitions.iter() {
+            for row in entry.value().rows.iter() {
+                if !f(row.value()) {
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn get_all_partitions(&self) -> Vec<(PartitionKey, Partition)> {
         self.partitions.iter()
             .map(|entry| {
