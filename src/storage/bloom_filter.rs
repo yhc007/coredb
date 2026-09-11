@@ -21,12 +21,35 @@ impl PartialEq for BloomFilter {
     }
 }
 
+/// `bloomfilter` 크레이트가 받아들이는 오탐률 범위. 밖이면 패닉한다.
+const DEFAULT_FP_RATE: f64 = 0.01;
+
 impl BloomFilter {
+    /// 인자를 크레이트가 받아들이는 범위로 조인 뒤 만든다.
+    ///
+    /// 쓰기 경로는 `items_count = 0`을 막고 있었지만, 디스크에서 읽어 올리는
+    /// 경로(`Deserialize`)에는 가드가 없었다. SSTable에 적힌 오탐률이 0이면
+    /// `Bloom::new_for_fp_rate`가 `fp_p > 0.0 && fp_p < 1.0`에서 패닉하고,
+    /// 그 호출이 기동 경로에 있어 **데이터베이스가 아예 뜨지 못한다**.
+    /// 실제로 운영 인스턴스가 이 패닉으로 크래시 루프에 빠졌다.
+    ///
+    /// 블룸 필터는 디스크 읽기를 줄이려는 장치일 뿐이라, 인자가 어긋나면
+    /// 최악이라도 읽기가 늘 뿐 답이 틀리지는 않는다. 기동을 막는 것보다 낫다.
     pub fn new(expected_items: u64, false_positive_rate: f64) -> Self {
+        let fp_rate = if false_positive_rate.is_finite()
+            && false_positive_rate > 0.0
+            && false_positive_rate < 1.0
+        {
+            false_positive_rate
+        } else {
+            DEFAULT_FP_RATE
+        };
+        let items = (expected_items as usize).max(1);
         Self {
-            bloom: Bloom::new_for_fp_rate(expected_items as usize, false_positive_rate).expect("Failed to create bloom filter"),
-            expected_items: expected_items as usize,
-            false_positive_rate,
+            bloom: Bloom::new_for_fp_rate(items, fp_rate)
+                .expect("bloom filter args are clamped into the accepted range above"),
+            expected_items: items,
+            false_positive_rate: fp_rate,
         }
     }
     
