@@ -953,17 +953,25 @@ impl QueryEngine {
                             (None, None) => std::cmp::Ordering::Equal,
                         }
                     });
-                    'sstable_scan: for sstable in &sstable_order {
-                        for pk in sstable.partition_index.keys() {
-                            if let Ok(Some(partition)) = sstable.read_partition(pk).await {
+                    // 파일을 파티션마다 여는 대신 한 번만 열고 순차로 훑는다.
+                    // `jobs`처럼 PK가 행마다 고유한 테이블은 파티션 = 행이라,
+                    // 예전 방식은 하루치 조회 한 번이 수십만 번의 File::open
+                    // 이었다.
+                    for sstable in &sstable_order {
+                        if result_rows.len() >= scan_cap {
+                            break;
+                        }
+                        let _ = sstable
+                            .scan_partitions(|_pk, partition| {
                                 for entry in partition.rows.iter() {
                                     result_rows.push(entry.value().clone());
                                     if result_rows.len() >= scan_cap {
-                                        break 'sstable_scan;
+                                        return false;
                                     }
                                 }
-                            }
-                        }
+                                true
+                            })
+                            .await;
                     }
                 }
             }

@@ -606,6 +606,69 @@ impl SSTable {
     }
 
     /// 파티션 읽기
+    /// 파일을 한 번만 열고 파티션을 순서대로 훑는다. 콜백이 `false`를 주면 멈춘다.
+    ///
+    /// `read_partition`은 호출마다 `File::open` + seek을 한다. 전체 스캔에서
+    /// 파티션 인덱스를 돌며 그걸 반복하면 파티션 수만큼 파일을 여는 셈이다.
+    /// `jobs`처럼 PRIMARY KEY가 행마다 고유한 테이블은 파티션 = 행이라,
+    /// 하루치 조회 한 번이 수십만 번의 open이 됐다 (실측 282초).
+    ///
+    /// 파티션은 키 순으로 기록되므로 오프셋 순서 = 키 순서다. 따라서 순차로
+    /// 읽어도 `partition_index.keys()`를 돌던 기존 순서가 그대로 유지된다 —
+    /// LIMIT N의 결정성이 달라지지 않는다.
+    pub async fn scan_partitions<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&PartitionKey, Partition) -> bool,
+    {
+        // BufReader로 감싼다. 파티션은 오프셋 순으로 연속 배치돼 있어 대부분
+        // seek 없이 이어 읽힌다 — 파티션마다 read_exact 시스템콜을 두 번씩
+        // 내던 것이 버퍼 하나로 묶인다.
+        let mut file = tokio::io::BufReader::with_capacity(
+            1 << 20,
+            File::open(&self.file_path).await?,
+        );
+        let mut pos: u64 = 0;
+        let mut first = true;
+
+        // BTreeMap은 이미 키 순이고 그게 곧 오프셋 순이다. 그래도 방어적으로
+        // 오프셋으로 한 번 정렬해 역방향 seek이 섞이지 않게 한다.
+        let mut entries: Vec<(&PartitionKey, u64)> =
+            self.partition_index.iter().map(|(k, o)| (k, *o)).collect();
+        entries.sort_by_key(|(_, o)| *o);
+
+        for (pk, offset) in entries {
+            if first || pos != offset {
+                file.seek(SeekFrom::Start(offset)).await?;
+                pos = offset;
+                first = false;
+            }
+
+            let mut size_buf = [0u8; 4];
+            // 잘린 파일을 만나면 거기까지만 읽는다. 기동 로그에 남는
+            // "early eof"가 이 경우다 — 한 파일 때문에 전체 스캔을 실패로
+            // 돌리면 조회가 통째로 죽는다.
+            if file.read_exact(&mut size_buf).await.is_err() {
+                break;
+            }
+            let size = u32::from_le_bytes(size_buf) as usize;
+
+            let mut buf = vec![0u8; size];
+            if file.read_exact(&mut buf).await.is_err() {
+                break;
+            }
+            pos = offset + 4 + size as u64;
+
+            let partition = match Self::deserialize_partition(&buf, &self.compression).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !f(pk, partition) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn read_partition(&self, partition_key: &PartitionKey) -> Result<Option<Partition>> {
         // Range veto: O(1) bounds check before the O(log N)
         // partition_index lookup. When the sidecar stored min/max
