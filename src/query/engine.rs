@@ -1692,11 +1692,41 @@ impl QueryEngine {
         // BigInt(123) against Timestamp(123) and silently misses every row.
         if let Some(first_pk) = schema.partition_key.first() {
             for condition in &where_clause.conditions {
-                if condition.column == first_pk.name {
-                    let coerced = condition.value.clone().coerce_to(&first_pk.data_type);
-                    partition_components.push(coerced);
-                    break;
+                // TOKEN(col)은 열 값이 아니라 그 토큰에 건 조건이다. 값을
+                // 파티션 키로 쓰면 엉뚱한 파티션을 집는다.
+                if condition.is_token {
+                    continue;
                 }
+                if condition.column != first_pk.name {
+                    continue;
+                }
+                // **등호일 때만** 단일 파티션 조회로 바꾼다.
+                //
+                // 예전에는 연산자를 보지 않고 컬럼 이름만 맞으면 값을 꺼냈다.
+                // 그래서 PK가 `work_date`인 테이블에
+                //
+                //     WHERE work_date>='2026-11-06' AND work_date<='2026-11-15'
+                //
+                // 를 던지면 `work_date='2026-11-06'` 한 행만 돌아왔다. 에러도
+                // 경고도 없이 — 호출자는 그게 구간 전체인 줄 안다. 실제로
+                // 대시보드의 기간별 리포트가 첫날만 보여주고 나머지를 전부
+                // 0으로 그리고 있었다.
+                //
+                // 등호가 아니면 여기서 None을 돌려 전체 스캔 경로로 보낸다.
+                // 그쪽의 `matches_condition`이 >=, <=, IN, LIKE를 제대로
+                // 처리한다. 느리지만 맞는다 — 빠르고 틀린 것보다 낫다.
+                //
+                // 조건을 건너뛰고 계속 도는 이유: `WHERE pk>='A' AND pk='B'`
+                // 처럼 범위와 등호가 같이 오면 등호 쪽을 찾아내야 한다.
+                if !matches!(
+                    condition.operator,
+                    crate::query::parser::ComparisonOperator::Equal
+                ) {
+                    continue;
+                }
+                let coerced = condition.value.clone().coerce_to(&first_pk.data_type);
+                partition_components.push(coerced);
+                break;
             }
         }
 
@@ -1845,6 +1875,139 @@ mod tests {
     use super::*;
     use crate::schema::{ColumnDefinition, CassandraDataType};
     
+    use crate::query::parser::{ComparisonOperator, Condition, WhereClause};
+    use crate::schema::TableOptions as SchemaTableOptions;
+
+    /// PK가 TEXT 한 컬럼인 최소 스키마. `extract_partition_key`만 보므로
+    /// 디스크를 건드리지 않는다.
+    fn schema_with_text_pk() -> TableSchema {
+        TableSchema {
+            name: "daily_rollup".to_string(),
+            keyspace: "ks".to_string(),
+            partition_key: vec![ColumnDefinition {
+                name: "work_date".to_string(),
+                data_type: CassandraDataType::Text,
+                is_static: false,
+            }],
+            clustering_key: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "payload".to_string(),
+                data_type: CassandraDataType::Text,
+                is_static: false,
+            }],
+            static_columns: vec![],
+            options: SchemaTableOptions::default(),
+        }
+    }
+
+    fn cond(column: &str, operator: ComparisonOperator, value: &str) -> Condition {
+        Condition {
+            column: column.to_string(),
+            operator,
+            value: CassandraValue::Text(value.to_string()),
+            is_token: false,
+        }
+    }
+
+    fn engine() -> QueryEngine {
+        QueryEngine::new(Arc::new(RwLock::new(HashMap::new())))
+    }
+
+    #[test]
+    fn equality_on_partition_key_is_a_point_lookup() {
+        let where_clause = WhereClause {
+            conditions: vec![cond("work_date", ComparisonOperator::Equal, "2026-11-06")],
+        };
+        let pk = engine()
+            .extract_partition_key(&schema_with_text_pk(), &where_clause)
+            .unwrap();
+        assert!(pk.is_some(), "등호는 단일 파티션 조회로 가야 한다");
+    }
+
+    /// 이게 회귀 방지의 핵심이다. 범위 조건을 점조회로 바꾸면 구간 조회가
+    /// 조용히 한 행으로 줄어든다 — 대시보드 기간별 리포트가 첫날만 보여주던
+    /// 원인이었다.
+    #[test]
+    fn range_on_partition_key_falls_through_to_a_scan() {
+        for op in [
+            ComparisonOperator::GreaterThanOrEqual,
+            ComparisonOperator::GreaterThan,
+            ComparisonOperator::LessThanOrEqual,
+            ComparisonOperator::LessThan,
+            ComparisonOperator::NotEqual,
+            ComparisonOperator::In,
+            ComparisonOperator::Like,
+        ] {
+            let where_clause = WhereClause {
+                conditions: vec![cond("work_date", op.clone(), "2026-11-06")],
+            };
+            let pk = engine()
+                .extract_partition_key(&schema_with_text_pk(), &where_clause)
+                .unwrap();
+            assert!(
+                pk.is_none(),
+                "{:?}는 점조회로 접히면 안 된다 — 전체 스캔에서 걸러야 한다",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn both_bounds_on_partition_key_still_scans() {
+        // 대시보드가 실제로 던지던 모양.
+        let where_clause = WhereClause {
+            conditions: vec![
+                cond("work_date", ComparisonOperator::GreaterThanOrEqual, "2026-11-06"),
+                cond("work_date", ComparisonOperator::LessThanOrEqual, "2026-11-15"),
+            ],
+        };
+        let pk = engine()
+            .extract_partition_key(&schema_with_text_pk(), &where_clause)
+            .unwrap();
+        assert!(pk.is_none(), "구간 조회가 시작일 한 행으로 줄어들면 안 된다");
+    }
+
+    #[test]
+    fn equality_is_found_even_after_a_range_condition() {
+        // 범위 조건에서 멈추지 않고 계속 찾아야 한다.
+        let where_clause = WhereClause {
+            conditions: vec![
+                cond("work_date", ComparisonOperator::GreaterThanOrEqual, "2026-11-06"),
+                cond("work_date", ComparisonOperator::Equal, "2026-11-10"),
+            ],
+        };
+        let pk = engine()
+            .extract_partition_key(&schema_with_text_pk(), &where_clause)
+            .unwrap();
+        let pk = pk.expect("등호가 있으면 점조회로 가야 한다");
+        assert_eq!(
+            pk.components,
+            vec![CassandraValue::Text("2026-11-10".to_string())]
+        );
+    }
+
+    #[test]
+    fn token_condition_is_not_a_partition_key() {
+        let mut c = cond("work_date", ComparisonOperator::Equal, "2026-11-06");
+        c.is_token = true;
+        let where_clause = WhereClause { conditions: vec![c] };
+        let pk = engine()
+            .extract_partition_key(&schema_with_text_pk(), &where_clause)
+            .unwrap();
+        assert!(pk.is_none(), "TOKEN(col) 값은 파티션 키가 아니다");
+    }
+
+    #[test]
+    fn non_key_column_is_never_a_partition_key() {
+        let where_clause = WhereClause {
+            conditions: vec![cond("payload", ComparisonOperator::Equal, "x")],
+        };
+        let pk = engine()
+            .extract_partition_key(&schema_with_text_pk(), &where_clause)
+            .unwrap();
+        assert!(pk.is_none());
+    }
+
     #[tokio::test]
     async fn test_create_keyspace_and_table() {
         let keyspaces = Arc::new(RwLock::new(HashMap::new()));
